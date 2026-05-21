@@ -16,6 +16,21 @@ Design documents, specs, plans, and this kind of Markdown are allowed without co
 
 ---
 
+## 📝 COMMIT RULE — `<Feature name>: <what we did>`
+
+Every commit message MUST start with the **actual feature name** being worked on (not the literal
+word "FEATURE"), followed by a colon and a short description of what we did. The feature name is the
+real component/feature, e.g.:
+
+- `Event Bus: add shared-memory ring buffer`
+- `Recorder: write session manifest on stop`
+- `Supervisor: log gap and auto-reconnect on driver crash`
+- `Design: add sensor-backbone design spec`
+
+Use a body when the "why" needs explaining. One feature per commit where practical.
+
+---
+
 ## Project: MMCO
 
 A software backbone that runs on a capture box and coordinates whatever sensors are plugged in
