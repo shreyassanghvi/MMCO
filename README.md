@@ -47,6 +47,16 @@ Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` �
 
 Legend: ✅ done · 🔜 next up · ⬜ not started
 
+### Known follow-ups
+
+- **Linux multiprocessing validation (Phase 3).** Development is on Windows, where `spawn` is the
+  default start method. The driver host spawns its child via `get_context("spawn")`, but the bus/log
+  queues and the stop event are created from the default context. On Windows these coincide; on the
+  Linux/WSL2 **runtime target** (default `fork`) this mixing must be verified — and if needed, all
+  `multiprocessing` objects should be created from a single shared `spawn` context. Run the full suite
+  (especially `tests/host/`) under WSL2/Linux and confirm green before relying on the cross-process
+  path there.
+
 ---
 
 ## Tech stack
