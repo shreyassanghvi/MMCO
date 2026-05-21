@@ -43,8 +43,12 @@ class LogChannel:
         except queue.Full:
             return False
 
-    def drain(self, timeout: float = 0.0) -> list[LogEvent]:
-        """Collect all currently available events, waiting up to ``timeout`` for the first."""
+    def drain(self, timeout: float = 0.0, grace: float = 0.05) -> list[LogEvent]:
+        """Collect available events: wait up to ``timeout`` for the first, ``grace`` for each next.
+
+        The ``grace`` window absorbs the latency of ``multiprocessing.Queue``'s feeder thread, so a
+        burst of ``emit()``s is not truncated by reading faster than the items are flushed.
+        """
         events: list[LogEvent] = []
         try:
             events.append(self._queue.get(timeout=timeout))
@@ -52,7 +56,7 @@ class LogChannel:
             return events
         while True:
             try:
-                events.append(self._queue.get_nowait())
+                events.append(self._queue.get(timeout=grace))
             except queue.Empty:
                 break
         return events
