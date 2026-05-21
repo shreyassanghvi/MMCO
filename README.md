@@ -16,11 +16,12 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 1 complete (pure core green); Phase 2 next.
-**Active branch:** `impl/phase-1-core-types` (off `master`).
+**Current stage:** Phase 2 complete (event bus green); Phase 3 next.
+**Active branch:** `impl/phase-2-event-bus` (off `master`).
 **Last updated:** 2026-05-21.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 37 passing.
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 49 passing
+(1 skipped: a POSIX-only shared-memory sweep test, skipped on Windows).
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -34,8 +35,8 @@ Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` �
 | —  | Phased implementation plan | ✅ Done |
 | 0  | Project scaffolding & tooling | ✅ Done — package, tooling, paths; 4 tests green |
 | 1  | Core types, contracts & error codes (pure) | ✅ Done — events, capabilities, driver ABC, clock, errors, manifest, log events |
-| 2  | Event bus transport | 🔜 Next |
-| 3  | Simulated driver + driver host | ⬜ Not started |
+| 2  | Event bus transport | ✅ Done — shared-memory ring, metadata queue, gen-checked producer/consumer |
+| 3  | Simulated driver + driver host | 🔜 Next |
 | 4  | Recorder + writers + manifest | ⬜ Not started |
 | 5  | Supervisor: health & graceful degradation | ⬜ Not started |
 | 6  | Session log + auto-summary | ⬜ Not started |
