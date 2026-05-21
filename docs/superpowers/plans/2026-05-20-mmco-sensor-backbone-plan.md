@@ -340,25 +340,117 @@ round-trip tested.
 
 **Goal:** Move payloads and metadata between a producer and the core without pickling big frames.
 
-**Tasks**
-- **2.1 Shared-memory ring buffer** — slot ring over `multiprocessing.shared_memory`, sized per stream
-  `capabilities` (4K-video ring and IMU ring sized independently). Each slot carries a **generation
-  counter `gen`**. **Non-blocking overflow = drop-oldest** + increment `dropped`, emitting
-  `E005 shm-buffer-full`. **The core (not the driver) creates and `unlink()`s the segment**; drivers
-  attach by name only; startup sweeps stale `mmco-*` segments and manages `resource_tracker`. *Tested
-  by:* single-process write→read; wrap-around; drop-oldest on full + `dropped` increment; **read
-  re-checks `gen` after copy and rejects an overwritten slot as a drop**; no leaked segment after a
-  simulated producer crash.
-- **2.2 Metadata queue** — records `{sensor_id, seq, t_acquire_ns, slot, length, gen}` over a
-  `multiprocessing.Queue`. *Tested by:* ordering preserved; record encode/decode incl. `gen`.
-- **2.3 Bus producer & consumer handles** — thin `BusProducer` (host side, copies payload into ring) /
-  `BusConsumer` (core side, gen-checked read). *Tested by:* in-process producer→consumer delivers
-  `(meta, payload)` intact; dropped-slot + gen-mismatch counters.
+**Branch:** `impl/phase-2-event-bus` (off `master`, after Phase 1 merge).
 
-**Files:** `src/mmco/bus/ring.py`, `bus/metaqueue.py`, `bus/bus.py`; `tests/bus/test_*.py`.
+**Design decisions (locked for this phase):**
+- **Primitives:** `multiprocessing.shared_memory.SharedMemory` for the payload ring,
+  `multiprocessing.Queue` for the metadata records. Stdlib `struct` lays out the ring header. **No new
+  runtime dependencies.** All Phase 2 tests run **single-process** (create + attach in the same
+  process); the real cross-process path is exercised in Phase 3.
+- **Ring shape (single-producer/single-consumer overwrite ring):** the segment holds a fixed header
+  (`magic`, `n_slots`, `slot_size`, `write_idx`, `read_idx`, `dropped`), then a per-slot table
+  (`gen`, `length` per slot), then the `n_slots × slot_size` data region. `n_slots`/`slot_size` are
+  sized per stream `capabilities` (a 4K-video ring and an IMU ring are sized independently).
+- **Ownership:** the **core creates and `unlink()`s** the segment (named with an `mmco-` prefix);
+  drivers **attach by name only** and never `unlink`. A `sweep_stale_segments()` helper clears leftover
+  `mmco-*` segments at startup.
+- **Drops are never silent:** on a full ring, `write()` does **drop-oldest** (advance `read_idx`),
+  increments the shared `dropped` counter, and surfaces `ErrorCode.SHM_BUFFER_FULL` to the caller (the
+  host turns that into a `LogEvent` in Phase 3). A reader **re-reads `gen` after copying** and treats a
+  changed `gen` as a drop (the slot was lapped mid-copy) rather than returning torn bytes.
+- **Platform note:** POSIX `resource_tracker`/`unlink` semantics differ on Windows; the stale-sweep /
+  leak test is Linux-only (`@pytest.mark.skipif(sys.platform == "win32")`). Read/write/wrap/drop/gen
+  tests are platform-neutral. Commands run via the project venv interpreter (`python -m ...`) as before.
 
-**Outcome:** The bus moves data correctly under test, drops are counted (never silent), and shm has a
-single owner with no leaks (still single-process; cross-process exercised in Phase 3).
+### Task 2.1 — Shared-memory ring buffer
+
+**Files:** create `src/mmco/bus/__init__.py`, `src/mmco/bus/ring.py`, `tests/bus/__init__.py`,
+`tests/bus/test_ring.py`. (Spec §3.1, §4.1.)
+
+A `RingBuffer` with `create(n_slots, slot_size)` (owns the segment, zero-inits the header) and
+`attach(name, n_slots, slot_size)` (attaches, never owns); `close()` detaches and `unlink()` (owner
+only) frees. `write(payload) -> SlotRef(slot, gen, length)` round-robins the write index, bumps the
+slot's `gen`, and writes length+bytes; on a full ring it drop-oldest + increments `dropped`.
+`read_slot(slot, gen, length) -> bytes | None` does a random-access copy keyed by a meta record and
+re-checks `gen` (returns `None` on mismatch). A `dropped` property reads the shared counter.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/bus/test_ring.py` assert: (a) a single-process
+  `create` → `write(b"...")` → `read_slot(*ref)` returns the same bytes; (b) writing more than
+  `n_slots` payloads wraps around and the latest writes are still readable; (c) filling the ring
+  without reading triggers drop-oldest — `dropped` increments and `write` reports
+  `ErrorCode.SHM_BUFFER_FULL`; (d) after a `write` to a slot, a second `write` that reuses that slot
+  bumps its `gen`, and a `read_slot` with the **stale** `gen` returns `None` (overwrite rejected);
+  (e) `write` of a payload larger than `slot_size` raises `ValueError`.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/bus/test_ring.py -v` → FAIL
+  (`No module named 'mmco.bus'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/bus/__init__.py`, `src/mmco/bus/ring.py` with a `SlotRef`
+  frozen dataclass and the `RingBuffer` class (stdlib `struct` for the header; `create`/`attach`/
+  `close`/`unlink`; `write`/`read_slot`; `dropped`). Add empty `tests/bus/__init__.py`.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/bus/test_ring.py -v` → all pass; ensure
+  each test `close()`s/`unlink()`s its segment so the suite leaves no segments behind.
+- [ ] **Step 5 — Add the stale-sweep test + helper (Linux-only).** Add a
+  `@pytest.mark.skipif(sys.platform == "win32")` test that creates a leftover `mmco-*` segment, calls
+  `sweep_stale_segments()`, and asserts it is gone; implement `sweep_stale_segments()` in `ring.py`.
+  Run `python -m pytest tests/bus/test_ring.py -v` (the new test **skips** on the Windows dev host).
+- [ ] **Step 6 — Commit.** Message: `Ring Buffer: add shared-memory SPSC ring with gen-checked reads`.
+
+### Task 2.2 — Metadata queue
+
+**Files:** create `src/mmco/bus/metaqueue.py`, `tests/bus/test_metaqueue.py`. (Spec §4.0.)
+
+A thin `MetaQueue` over `multiprocessing.Queue` carrying `EventMeta` records
+(`{sensor_id, seq, t_acquire_ns, slot, length, gen}`). `put(meta) -> bool` is non-blocking (returns
+`False` if full); `get(timeout) -> EventMeta | None`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/bus/test_metaqueue.py` assert: (a) `put` then
+  `get` returns an `EventMeta` **equal** to the original, including `gen` (encode/decode survives the
+  queue's pickling); (b) FIFO order is preserved across several `put`s; (c) `get` on an empty queue
+  with a short timeout returns `None`.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/bus/test_metaqueue.py -v` → FAIL
+  (`cannot import name 'metaqueue'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/bus/metaqueue.py` wrapping `multiprocessing.Queue`
+  (optional `maxsize`), with non-blocking `put` (catch `queue.Full` → `False`) and `get` with timeout
+  (catch `queue.Empty` → `None`).
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/bus/test_metaqueue.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Meta Queue: add ordered metadata queue over multiprocessing.Queue`.
+
+### Task 2.3 — Bus producer & consumer handles
+
+**Files:** create `src/mmco/bus/bus.py`, `tests/bus/test_bus.py`. (Spec §4.1.)
+
+`BusProducer(ring, metaqueue)` with `publish(sensor_id, seq, t_acquire_ns, payload) -> bool`: copies
+the payload into the ring, builds the `EventMeta` from the returned `SlotRef`, and puts it on the
+queue; counts a drop (ring-full or queue-full) and returns `False` on failure.
+`BusConsumer(ring, metaqueue)` with `poll(timeout) -> tuple[EventMeta, bytes] | None`: gets a meta,
+reads the ring with gen-recheck, counts a drop and returns `None` on gen-mismatch, else returns the
+`(meta, payload)` pair.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/bus/test_bus.py` assert: (a) an in-process
+  `publish(...)` followed by `poll(...)` returns `(EventMeta, payload)` with the payload bytes and all
+  meta fields intact; (b) when the ring is overrun (publish faster than poll past `n_slots`), the
+  producer's `dropped` count rises and no torn payload is ever returned; (c) a `poll` whose meta points
+  at a slot whose `gen` has since advanced returns `None` and increments the consumer's drop counter.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/bus/test_bus.py -v` → FAIL
+  (`cannot import name 'bus'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/bus/bus.py` with `BusProducer` and `BusConsumer` composing
+  the `RingBuffer` + `MetaQueue`, building `EventMeta` from `SlotRef`, and exposing `dropped` counters.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/bus/test_bus.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Event Bus: add producer/consumer handles over ring + meta queue`.
+
+### Task 2.4 — Phase 2 gate
+
+- [ ] **Step 1 — Full suite + lint.** `python -m pytest` → all phases green (the Linux-only sweep test
+  shows as skipped on Windows); `python -m ruff check .` → `All checks passed!`.
+- [ ] **Step 2 — Update README.** Flip the Phase 2 row to ✅ and the Phase 3 row to 🔜; refresh the
+  test count and "Current stage" line.
+- [ ] **Step 3 — Commit.** Message: `Docs: mark Phase 2 complete in progress README`.
+
+**Files (Phase 2 total):** `src/mmco/bus/{__init__,ring,metaqueue,bus}.py`; matching
+`tests/bus/test_*.py` (+ `tests/bus/__init__.py`).
+
+**Outcome:** The bus moves data correctly under test, drops are counted (never silent) via both the
+ring's `dropped` counter and the consumer's gen-mismatch detection, and shm has a single owner with no
+leaks (still single-process; cross-process exercised in Phase 3).
 
 ---
 
