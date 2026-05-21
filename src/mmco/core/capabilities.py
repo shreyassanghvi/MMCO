@@ -129,3 +129,16 @@ class Capabilities:
                 f"{self.type.name} stream requires a {expected.__name__}, "
                 f"got {type(self.schema).__name__}"
             )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "type": self.type.name,
+            "rate": self.rate,
+            "schema": self.schema.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> Capabilities:
+        stream_type = StreamType[data["type"]]
+        schema = _SCHEMA_FOR_TYPE[stream_type].from_dict(data["schema"])
+        return cls(type=stream_type, rate=data["rate"], schema=schema)

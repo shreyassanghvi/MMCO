@@ -58,3 +58,27 @@ def test_capabilities_rejects_mismatched_type_and_schema():
 def test_empty_tabular_schema_is_rejected():
     with pytest.raises(ValueError):
         TabularSchema(columns=())
+
+
+def test_capabilities_round_trips_for_each_stream_type():
+    cases = [
+        Capabilities(
+            type=StreamType.VIDEO,
+            rate=30.0,
+            schema=VideoSchema(
+                codec_or_raw="raw", width=640, height=480, pixel_format="yuyv422"
+            ),
+        ),
+        Capabilities(
+            type=StreamType.AUDIO,
+            rate=None,
+            schema=AudioSchema(sample_rate=48_000, channels=2, sample_format="s16le"),
+        ),
+        Capabilities(
+            type=StreamType.TABULAR,
+            rate=100.0,
+            schema=TabularSchema(columns=(Column(name="ax", dtype="float32"),)),
+        ),
+    ]
+    for caps in cases:
+        assert Capabilities.from_dict(caps.to_dict()) == caps
