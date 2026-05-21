@@ -25,7 +25,7 @@ class BusProducer:
     def publish(
         self, *, sensor_id: str, seq: int, t_acquire_ns: int, payload: bytes
     ) -> ErrorCode | None:
-        """Write ``payload``, enqueue its meta; return an error code on backpressure, else ``None``."""
+        """Write ``payload`` + enqueue its meta; an error code on backpressure, else ``None``."""
         ref = self._ring.write(payload)
         meta = EventMeta(
             sensor_id=sensor_id,
@@ -50,7 +50,7 @@ class BusConsumer:
         self.dropped = 0
 
     def poll(self, timeout: float = 0.0) -> tuple[EventMeta, bytes] | None:
-        """Return the next ``(meta, payload)`` pair, or ``None`` if none is available / it lapsed."""
+        """Return the next ``(meta, payload)`` pair, or ``None`` if none available / lapsed."""
         meta = self._metaqueue.get(timeout=timeout)
         if meta is None:
             return None
