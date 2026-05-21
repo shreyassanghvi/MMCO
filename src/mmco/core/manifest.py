@@ -80,7 +80,7 @@ class StreamBlock:
     type: StreamType
     capabilities: Capabilities
     latency_offset: int
-    dropped: bool
+    dropped: int  # count of events dropped for this stream (0 = none)
     segments: tuple[Segment, ...]
     gaps: tuple[Gap, ...]
 

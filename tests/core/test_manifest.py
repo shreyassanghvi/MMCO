@@ -17,7 +17,7 @@ def _manifest() -> SessionManifest:
         type=StreamType.TABULAR,
         capabilities=caps,
         latency_offset=250,
-        dropped=False,
+        dropped=0,
         segments=(
             Segment(
                 file_path="imu0/000.parquet",

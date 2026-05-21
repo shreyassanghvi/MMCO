@@ -602,26 +602,142 @@ driver crash.
 **Goal:** Turn drained events into files on disk plus a session manifest — the **first end-to-end
 recording** and the always-green CI integration path.
 
-**Tasks**
-- **4.1 Writer interface** — `StreamWriter` (open/write_event/close) selected per stream type, and
-  **registered through the same plugin mechanism as drivers** (a new stream type ships driver + writer
-  together). Writers emit a per-block timestamp sidecar (parquet `t_event` column / mp4 PTS→monotonic
-  table), not just first/last. *Tested by:* contract enforced; factory picks correct writer for a
-  `StreamType`; sidecar emitted.
-- **4.2 Parquet writer** — batches tabular rows (sim/serial) to parquet via pyarrow with a `t_event`
-  column. *Tested by:* rows written, schema correct, per-row timestamps preserved, file readable back.
-- **4.3 Manifest author** — opens manifest at session start (monotonic↔wall anchor), records per-stream
-  `segments[]` + `latency_offset` + `dropped`, writes `manifest.json` on stop. *Tested by:* manifest
-  matches written files; one segment per continuous run; timestamps monotonic.
-- **4.4 Recorder wiring** — `BusConsumer` → route by sensor → writer + manifest segments; drops from the
-  bus are recorded in the stream's `dropped` count. *Tested by:* end-to-end session with the simulated
-  driver produces parquet + manifest; **integration test asserts files exist, timestamps monotonic,
-  cross-stream alignment within ±2 ms, drops surfaced.**
+**Branch:** `impl/phase-4-recorder` (off `master`, after Phase 3 merge).
 
-**Files:** `src/mmco/record/writer.py`, `record/parquet_writer.py`, `record/manifest_author.py`,
-`record/recorder.py`; `tests/record/test_*.py`, `tests/integration/test_session_simulated.py`.
+**Design decisions (locked for this phase):**
+- **New runtime dependency: `pyarrow`** (parquet). Added to `[project.dependencies]` in
+  `pyproject.toml` and installed into the venv during Task 4.2. First non-stdlib runtime dep.
+- **Tabular payload convention.** A tabular `DriverSample.payload` is the row's values packed with
+  `struct` in `TabularSchema` column order. The writer derives both a `struct` format and an Arrow
+  schema from a small dtype map (`int64`/`int32`/`float32`/`float64` → struct codes / `pyarrow` types).
+  Writers always emit a per-row `t_event` column (for parquet the timestamp sidecar lives in-file).
+- **`t_event` is computed by the recorder** via the Phase 1 `OffsetRegistry`
+  (`t_event = t_acquire − offset`); the manifest stores each stream's `latency_offset`.
+- **Writer registry now, full plugin unification later.** A simple `StreamType → writer class`
+  registry selects the writer this phase; merging it into the *driver* entry-point plugin mechanism
+  (so a stream type ships driver + writer together) is Phase 8 — noted, not built here.
+- **One continuous run → one segment → one file.** Multi-segment streams (reconnects) are exercised in
+  Phase 5; here each stream yields a single segment.
+- **Scope of the integration test.** Asserts files exist, the manifest matches the written files,
+  per-row timestamps are monotonic, and bus drops are surfaced in the stream's `dropped`. The strict
+  **±2 ms cross-stream alignment** check (spec §4.2) needs a real reference stream and is **deferred to
+  Phase 9** (sim + webcam) — flagged so it isn't lost.
+- Tests write to pytest's `tmp_path`; commands run via the project venv interpreter.
+- **Build order:** 4.1 → 4.2 → 4.3 → 4.4 → 4.5 gate.
 
-**Outcome:** `clone → run-in-test → recording`. Simulated-only integration test is the CI backstop.
+### Task 4.1 — Writer contract & per-type registry
+
+**Files:** create `src/mmco/record/__init__.py`, `src/mmco/record/writer.py`,
+`tests/record/test_writer.py`. (Spec §5.)
+
+A `StreamWriter` ABC: `open()`, `write_event(t_event_ns, payload)`, `close()`, plus read-only
+`file_path`, `start_timestamp`, `end_timestamp` (first/last `t_event` seen). A module-level registry —
+`register_writer(stream_type, cls)` and `writer_for(stream_type, *, capabilities, file_path)` — selects
+the writer class for a `StreamType`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/record/test_writer.py` assert: (a) `StreamWriter`
+  cannot be instantiated directly (`TypeError`); (b) a tiny in-test fake writer subclass registered via
+  `register_writer` is returned by `writer_for` for its `StreamType`; (c) `writer_for` on an
+  unregistered `StreamType` raises (`KeyError`/`ValueError`); (d) the fake records `start_timestamp`/
+  `end_timestamp` as the first/last `t_event` passed to `write_event`.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/record/test_writer.py -v` → FAIL
+  (`No module named 'mmco.record'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/record/__init__.py`, `src/mmco/record/writer.py` with the
+  `StreamWriter` ABC and the registry functions (a private dict; `writer_for` raises on miss).
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/record/test_writer.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Writers: add StreamWriter contract and per-type writer registry`.
+
+### Task 4.2 — Parquet writer
+
+**Files:** modify `pyproject.toml` (add `pyarrow`); create `src/mmco/record/parquet_writer.py`,
+`tests/record/test_parquet_writer.py`. (Spec §5, §5.1.)
+
+A `ParquetWriter(StreamWriter)` for `TABULAR` streams: derives a `struct` format + Arrow schema from
+the `Capabilities` `TabularSchema`, buffers decoded rows on `write_event`, and on `close` writes a
+parquet file whose columns are `t_event` (int64) plus the schema columns. Registers itself for
+`StreamType.TABULAR`.
+
+- [ ] **Step 1 — Add the dependency.** Add `pyarrow` to `[project.dependencies]` in `pyproject.toml`;
+  run `python -m pip install -e ".[dev]"` so the venv has it.
+- [ ] **Step 2 — Write the failing tests.** In `tests/record/test_parquet_writer.py` (writing under
+  `tmp_path`, sim-style `struct.pack("<q", n)` payloads, a one-column `int64` schema) assert: (a) after
+  `open` → three `write_event(t, payload)` → `close`, the parquet file exists and reads back (via
+  `pyarrow.parquet`) with three rows; (b) the `t_event` column equals the timestamps passed, in order;
+  (c) the data column decodes to the original values; (d) `start_timestamp`/`end_timestamp` equal the
+  first/last `t_event`.
+- [ ] **Step 3 — Run; confirm RED.** `python -m pytest tests/record/test_parquet_writer.py -v` → FAIL
+  (`cannot import name 'parquet_writer'`).
+- [ ] **Step 4 — Implement.** Add `src/mmco/record/parquet_writer.py` with the dtype map, row buffering,
+  and the pyarrow write on `close`; call `register_writer(StreamType.TABULAR, ParquetWriter)`.
+- [ ] **Step 5 — Run; confirm GREEN.** `python -m pytest tests/record/test_parquet_writer.py -v` → pass.
+- [ ] **Step 6 — Commit.** Message: `Parquet Writer: add pyarrow tabular writer with per-row t_event`.
+
+### Task 4.3 — Manifest author
+
+**Files:** create `src/mmco/record/manifest_author.py`, `tests/record/test_manifest_author.py`.
+(Spec §5.)
+
+A `ManifestAuthor` that opens at session start with the `session_id`, `output_dir`, and a
+`ClockAnchor`; `add_stream(sensor_id, type, capabilities, latency_offset)`; `add_segment(sensor_id,
+segment)`; `set_dropped(sensor_id, n)`; and `write(path)` that assembles a Phase 1 `SessionManifest`
+and writes `manifest.json`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/record/test_manifest_author.py` (under
+  `tmp_path`) assert: (a) authoring one stream with one `Segment` + a `dropped` count, then `write`,
+  produces a `manifest.json` that `SessionManifest.from_json` reads back equal to what was authored;
+  (b) the stream block carries the `latency_offset` and `dropped` given; (c) the segment's
+  `start_timestamp <= end_timestamp` (monotonic).
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/record/test_manifest_author.py -v` → FAIL
+  (`cannot import name 'manifest_author'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/record/manifest_author.py` building `StreamBlock`s +
+  `SessionManifest` from the accumulated state and writing it via `to_json`.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/record/test_manifest_author.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Manifest Author: assemble and write session manifest.json`.
+
+### Task 4.4 — Recorder wiring (first end-to-end recording)
+
+**Files:** create `src/mmco/record/recorder.py`, `tests/record/test_recorder.py`,
+`tests/integration/test_session_simulated.py`. (Spec §4.1, §5.)
+
+A `Recorder` that, given a `BusConsumer`, a per-sensor `Capabilities` map, an `OffsetRegistry`, a
+`session_id`, and a base output dir, drains the bus: routes each `(meta, payload)` by `sensor_id` to
+that sensor's writer (created lazily under `recordings/<session_id>/`), writing `t_event =
+offsets.event_time(sensor_id, meta.t_acquire_ns)`; on stop it closes writers, records each stream's
+`dropped` (from the consumer), and asks the `ManifestAuthor` to write `manifest.json`.
+
+- [ ] **Step 1 — Write the failing unit test.** In `tests/record/test_recorder.py`, drive a `Recorder`
+  directly by publishing a handful of tabular events through an in-process bus, run one drain pass,
+  stop, and assert: a parquet file and `manifest.json` exist under `recordings/<session_id>/`, and the
+  manifest's single segment `file_path` matches the written parquet.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/record/test_recorder.py -v` → FAIL
+  (`cannot import name 'recorder'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/record/recorder.py` (lazy per-sensor writer creation via
+  `writer_for`, `t_event` via the offset registry, dropped from `consumer.dropped`, manifest on stop).
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/record/test_recorder.py -v` → pass.
+- [ ] **Step 5 — Write the end-to-end integration test.** In
+  `tests/integration/test_session_simulated.py`, spawn a `SimulatedDriver` host (Phase 3), run the
+  `Recorder` against the bus for a fixed number of events, stop, and assert: `manifest.json` + the
+  parquet exist; the parquet's `t_event` column is **monotonic non-decreasing**; the manifest segment's
+  `start/end` bracket the data; and any bus drops appear in the stream's `dropped`. *(The ±2 ms
+  cross-stream alignment assertion is deferred to Phase 9.)*
+- [ ] **Step 6 — Run; confirm GREEN.** `python -m pytest tests/integration/test_session_simulated.py -v`
+  → pass (generous timeouts).
+- [ ] **Step 7 — Commit.** Message:
+  `Recorder: wire bus consumer to writers and manifest (first end-to-end recording)`.
+
+### Task 4.5 — Phase 4 gate
+
+- [ ] **Step 1 — Full suite + lint.** `python -m pytest` → all phases green (Linux-only checks skip on
+  Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 2 — Update README.** Flip Phase 4 to ✅, Phase 5 to 🔜; refresh test count + stage line;
+  note the first end-to-end recording works.
+- [ ] **Step 3 — Commit.** Message: `Docs: mark Phase 4 complete in progress README`.
+
+**Files (Phase 4 total):** `src/mmco/record/{__init__,writer,parquet_writer,manifest_author,
+recorder}.py`; `tests/record/test_*.py`; `tests/integration/test_session_simulated.py`.
+
+**Outcome:** `clone → run-in-test → recording`. A simulated-only end-to-end session writes parquet +
+`manifest.json` with monotonic per-row timestamps and surfaced drops — the always-green CI backstop.
 
 ---
 
