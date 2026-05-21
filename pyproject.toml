@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mmco"
+version = "0.0.0"
+description = "Multimodal capture-box sensor-coordination backbone (wet-lab analog to ROS 2 / Holoscan)."
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mmco"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+# Optional in Phase 0: config only, not yet gating CI.
+[tool.mypy]
+python_version = "3.14"
+packages = ["mmco"]
+strict = true
