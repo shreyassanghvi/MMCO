@@ -16,12 +16,13 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 3 complete (cross-process path green); Phase 4 next.
-**Active branch:** `impl/phase-3-sim-driver` (off `master`).
+**Current stage:** Phase 4 complete (first end-to-end recording green); Phase 5 next.
+**Active branch:** `impl/phase-4-recorder` (off `master`).
 **Last updated:** 2026-05-21.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 60 passing
-(1 skipped: a POSIX-only shared-memory sweep test, skipped on Windows).
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 70 passing
+(1 skipped: a POSIX-only shared-memory sweep test, skipped on Windows). A simulated session writes
+parquet + `manifest.json` end-to-end with no hardware.
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -37,8 +38,8 @@ Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` �
 | 1  | Core types, contracts & error codes (pure) | ✅ Done — events, capabilities, driver ABC, clock, errors, manifest, log events |
 | 2  | Event bus transport | ✅ Done — shared-memory ring, metadata queue, gen-checked producer/consumer |
 | 3  | Simulated driver + driver host | ✅ Done — sim driver, control/log channels, cross-process host |
-| 4  | Recorder + writers + manifest | 🔜 Next |
-| 5  | Supervisor: health & graceful degradation | ⬜ Not started |
+| 4  | Recorder + writers + manifest | ✅ Done — writer registry, parquet writer, manifest author, recorder + e2e |
+| 5  | Supervisor: health & graceful degradation | 🔜 Next |
 | 6  | Session log + auto-summary | ⬜ Not started |
 | 7  | Control surface: config, CLI, live status | ⬜ Not started |
 | 8  | Device discovery + default session + out-of-box | ⬜ Not started |
