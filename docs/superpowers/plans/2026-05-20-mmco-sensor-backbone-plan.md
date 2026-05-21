@@ -66,18 +66,81 @@ drivers (mic, serial IMU, IP camera, logfile), MCAP writer, ROS 2 packaging, and
 **Goal:** A clean, installable package with a passing test runner so every later phase has a home and a
 green baseline.
 
-**Tasks**
-- **0.1 Package layout & `pyproject.toml`** — create `src/mmco/` package, `tests/`, configure
-  setuptools/hatch, pin Python 3.14. *Tested by:* `pip install -e .` succeeds; `import mmco` works.
-- **0.2 Test + lint tooling** — add pytest (+`pytest` config), ruff, optional mypy. *Tested by:* a
-  trivial `test_smoke.py` passes; `ruff check` clean.
-- **0.3 `.gitignore`** — ignore `.venv/`, `.idea/`, `__pycache__/`, recordings output dir.
-- **0.4 Recordings output convention** — define `recordings/<session_id>/` layout as a constant.
+**Branch:** `impl/phase-0-scaffolding` (off `master`).
 
-**Files:** `pyproject.toml`, `src/mmco/__init__.py`, `tests/test_smoke.py`, `.gitignore`,
-`src/mmco/paths.py`.
+**Build/tooling decisions (locked for this phase):**
+- **Build backend:** `hatchling` with **src-layout** (`src/mmco/`) — modern, zero-boilerplate
+  src-layout support, no `MANIFEST.in`.
+- **Python:** `requires-python = ">=3.14"` (dev host confirmed on CPython 3.14.3).
+- **Lint:** `ruff` (lint + format). Do **not** set `target-version` — ruff infers it from
+  `requires-python`, avoiding an invalid `py314` literal on older ruff builds.
+- **Types:** `mypy` is **optional** this phase — config only, not gating.
+- **Commands:** run tools through the project venv interpreter as `python -m <tool>` so steps are
+  shell-agnostic (PowerShell / WSL / PyCharm terminal).
 
-**Outcome:** `pytest` runs green; repo clean; `mmco` importable.
+> Outline task **0.3 (`.gitignore`)** is **already committed** — nothing to do there. The work below is
+> 0.1 (package skeleton), 0.2 (tooling config), and 0.4 (recordings path convention). No source code is
+> reproduced in this plan by repo convention; the steps state files, commands, and assertions only.
+
+### Task 0.1 — Installable package skeleton
+
+**Files:** create `pyproject.toml`, `src/mmco/__init__.py`, `tests/test_smoke.py`.
+
+- [ ] **Step 1 — Write the failing smoke test.** In `tests/test_smoke.py`, add one test that imports
+  `mmco` and asserts `mmco.__version__` is a non-empty `str`.
+- [ ] **Step 2 — Run it; confirm it fails.** `python -m pytest tests/test_smoke.py -v` →
+  FAIL with `ModuleNotFoundError: No module named 'mmco'` (package doesn't exist yet).
+- [ ] **Step 3 — Create the package + build config.** Add `src/mmco/__init__.py` with a module
+  docstring and `__version__ = "0.0.0"`. Add `pyproject.toml`: `[build-system]` using `hatchling`;
+  `[project]` with `name = "mmco"`, `version = "0.0.0"`, `requires-python = ">=3.14"`, empty runtime
+  `dependencies`, and a `dev` optional-dependencies group (`pytest`, `ruff`, `mypy`); a
+  `[tool.hatch.build.targets.wheel]` entry pointing `packages` at `src/mmco`.
+- [ ] **Step 4 — Install editable; confirm the test passes.** `python -m pip install -e ".[dev]"` then
+  `python -m pytest tests/test_smoke.py -v` → install succeeds, **1 passed**.
+- [ ] **Step 5 — Commit.** `git commit` the three files with message
+  `Project Setup: add installable mmco package skeleton with smoke test`.
+
+### Task 0.2 — Test & lint tooling configuration
+
+**Files:** modify `pyproject.toml` (append tool config tables).
+
+- [ ] **Step 1 — Add tool config.** Append `[tool.pytest.ini_options]` (`testpaths = ["tests"]`,
+  `addopts = "-ra"`), `[tool.ruff]` (`line-length = 100`, `src = ["src", "tests"]`) with a
+  `[tool.ruff.lint]` `select` of `["E", "F", "I", "UP", "B"]`, and an optional `[tool.mypy]`
+  (`python_version = "3.14"`, `packages = ["mmco"]`, `strict = true`) — not gating yet.
+- [ ] **Step 2 — Run the tooling; confirm clean.** `python -m ruff check .` → `All checks passed!`;
+  `python -m pytest -v` discovers `tests/` and the smoke test PASSES.
+- [ ] **Step 3 — Commit.** `git commit pyproject.toml` with message
+  `Project Setup: configure pytest, ruff, and optional mypy`.
+
+### Task 0.4 — Recordings output-path convention
+
+**Files:** create `tests/test_paths.py`, `src/mmco/paths.py`.
+
+Defines the on-disk layout every later phase writes into — `recordings/<session_id>/` containing
+`manifest.json`, `session.log.jsonl`, `summary.md` (filenames match spec §5 and Phases 4/6). Pure path
+math: **no I/O, no directory creation** in this module.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/test_paths.py` assert: (a) `session_dir(base,
+  session_id)` equals `base/recordings/<session_id>`; (b) `manifest_path`, `session_log_path`,
+  `summary_path` of a session dir append the canonical filenames; (c) the four filename constants
+  (`RECORDINGS_DIRNAME`, `MANIFEST_FILENAME`, `SESSION_LOG_FILENAME`, `SUMMARY_FILENAME`) are the
+  expected stable strings.
+- [ ] **Step 2 — Run; confirm it fails.** `python -m pytest tests/test_paths.py -v` →
+  FAIL with `ModuleNotFoundError: No module named 'mmco.paths'`.
+- [ ] **Step 3 — Write minimal implementation.** Create `src/mmco/paths.py` with the four filename
+  constants and pure functions `recordings_root(base)`, `session_dir(base, session_id)`,
+  `manifest_path(session_dir)`, `session_log_path(session_dir)`, `summary_path(session_dir)` — all
+  `pathlib.Path` construction, no filesystem calls.
+- [ ] **Step 4 — Run; confirm it passes.** `python -m pytest tests/test_paths.py -v` → **3 passed**.
+- [ ] **Step 5 — Commit.** `git commit` both files with message
+  `Paths: define recordings/<session_id> layout and artifact filenames`.
+
+> **Deferred (YAGNI):** `session_id` *generation* (e.g. UTC-timestamp ids) and actual directory creation
+> land where sessions start (Phase 4/7), not here.
+
+**Phase 0 outcome:** `python -m pytest` runs green (smoke + paths), `python -m ruff check .` is clean,
+`mmco` is importable, and the recordings layout is a single source of truth in `mmco.paths`.
 
 ---
 
