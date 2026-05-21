@@ -150,42 +150,189 @@ math: **no I/O, no directory creation** in this module.
 error-code taxonomy and log-event model that make the system self-explaining — trivially TDD-able with
 no processes or hardware.
 
-**Tasks**
-- **1.1 Event & metadata types** — `SensorEvent` (driver returns `payload` bytes/buffer +
-  `payload_schema_ref`; host adds sensor_id, seq, t_acquire_ns) and the metadata record
-  `{sensor_id, seq, t_acquire_ns, slot, length, gen}` that travels on the queue (`gen` = slot
-  generation). Spec §4.0. *Tested by:* construction, equality, field validation; driver-set vs
-  host-set fields enforced.
-- **1.2 Stream capabilities & payload schema** — `StreamType` enum (video/audio/tabular),
-  `Capabilities` (type, rate, schema descriptor). Schema descriptors per §4.0: tabular = ordered
-  `{name, dtype}` columns; video = `{codec_or_raw, width, height, pixel_format}`; audio =
-  `{sample_rate, channels, sample_format}`. *Tested by:* schema round-trips; invalid combos rejected.
-- **1.3 `SensorDriver` abstract base (the plugin contract)** — `open() / read() / close() /
-  capabilities / health()`; `health()` is a heartbeat, never a blocking call the core makes into a
-  hung driver. Driver returns payload bytes only — **never touches shared memory** (the host copies).
-  *Tested by:* a tiny in-test fake subclass satisfies the contract; abstract methods enforced.
-- **1.4 Clock reference & latency-offset registry** — monotonic source wrapper; registry mapping
-  sensor_id → offset; `t_event = t_acquire − offset`. *Tested by:* offset math, missing-offset default,
-  monotonic↔wall anchor capture.
-- **1.5 Session manifest model** — dataclasses for session + per-stream blocks. Each block has
-  `{sensor_id, type, capabilities, latency_offset, dropped, segments[], gaps[]}` where a **segment** is
-  `{file_path, start_timestamp, end_timestamp, block_index}` and a **gap** is
-  `{start, end, reason, code}` (spec §5). `segments[]` (not a single `file_path`) so reconnects are
-  representable. JSON (de)serialize. *Tested by:* round-trip serialization; multi-segment + gap
-  ordering; schema fields present.
-- **1.6 Error-code taxonomy** — an `ErrorCode` enum giving each failure a stable generic code + default
-  human message, e.g. `MMCO-E001 device-not-found`, `E002 driver-crash`, `E003 watchdog-timeout`,
-  `E004 device-disconnected`, `E005 shm-buffer-full`, `E006 config-invalid`, `E007 writer-failure`.
-  *Tested by:* every code has a unique id + message; lookup by id; codes are stable strings.
-- **1.7 Log-event model** — structured `LogEvent` (t_ns, level, optional `code: ErrorCode`, optional
-  sensor_id, message, extra fields) with JSONL (de)serialize. The shared shape every component emits.
-  *Tested by:* round-trip JSONL; code attaches to event; level filtering.
+**Branch:** `impl/phase-1-core-types` (off `master`, after Phase 0 merge).
 
-**Files:** `src/mmco/core/events.py`, `core/capabilities.py`, `core/driver.py`, `core/clock.py`,
-`core/manifest.py`, `core/errors.py`, `core/logevent.py`; matching `tests/core/test_*.py`.
+**Design decisions (locked for this phase):**
+- **Pure stdlib only** — `dataclasses`, `enum`, `json`, `time`. **No new runtime dependencies**, no
+  filesystem, no processes. Value types are **frozen dataclasses**; validation raises `ValueError`.
+- **Package layout** — everything lands in a new `src/mmco/core/` subpackage; tests in `tests/core/`.
+  Add `src/mmco/core/__init__.py` and `tests/core/__init__.py` in the first task and reuse them after.
+- **Build order (dependency-safe), not numeric order:** 1.1 → 1.2 → 1.3 → 1.4 → **1.6 → 1.5 → 1.7**.
+  The error-code taxonomy (1.6) ships before the manifest (1.5, `gap.code`) and the log-event (1.7,
+  `event.code`) because both reference `ErrorCode`.
+- **Commands:** `python -m pytest <path> -v` per task, `python -m ruff check .` before each commit
+  (run via the project venv interpreter as in Phase 0). No source code is reproduced in this plan.
 
-**Outcome:** A fully unit-tested pure core, including the error-code taxonomy and log-event shape used by
-later phases. No processes yet.
+### Task 1.1 — Event & metadata value types
+
+**Files:** create `src/mmco/core/__init__.py`, `src/mmco/core/events.py`, `tests/core/__init__.py`,
+`tests/core/test_events.py`. (Spec §4.0.)
+
+Three frozen value types: `DriverSample` (what a driver's `read()` returns: `payload: bytes`,
+`payload_schema_ref: str`); `SensorEvent` (host-completed: the sample's fields **plus** `sensor_id`,
+`seq`, `t_acquire_ns`, built via `SensorEvent.from_sample(sample, *, sensor_id, seq, t_acquire_ns)`);
+and `EventMeta`, the queue record `{sensor_id, seq, t_acquire_ns, slot, length, gen}` (`gen` = slot
+generation).
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/core/test_events.py` assert: (a) `DriverSample`
+  holds `payload`/`payload_schema_ref` and compares by value; (b) `SensorEvent.from_sample(...)` copies
+  the driver fields and sets the three host fields — confirming the driver→host split; (c) `EventMeta`
+  constructs with all six fields and equality works; (d) negative `seq`, `slot`, `length`, `gen`, or
+  `t_acquire_ns`, and empty `sensor_id`, raise `ValueError`.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/core/test_events.py -v` →
+  FAIL (`ModuleNotFoundError: No module named 'mmco.core'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/core/__init__.py` (package docstring) and
+  `src/mmco/core/events.py` with the three frozen dataclasses, the `from_sample` classmethod, and
+  `__post_init__` validation raising `ValueError`. Add empty `tests/core/__init__.py`.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/core/test_events.py -v` → all pass.
+- [ ] **Step 5 — Commit.** Message: `Events: add DriverSample, SensorEvent, and EventMeta value types`.
+
+### Task 1.2 — Stream capabilities & payload schema
+
+**Files:** create `src/mmco/core/capabilities.py`, `tests/core/test_capabilities.py`. (Spec §4.0.)
+
+`StreamType` enum (`VIDEO`, `AUDIO`, `TABULAR`); three schema descriptors — `TabularSchema` (ordered
+tuple of `Column{name, dtype}`), `VideoSchema{codec_or_raw, width, height, pixel_format}`,
+`AudioSchema{sample_rate, channels, sample_format}`; and `Capabilities{type, rate, schema}` that
+validates the schema descriptor matches the `type`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/core/test_capabilities.py` assert: (a) each
+  schema descriptor round-trips through `to_dict`/`from_dict`; (b) `TabularSchema` preserves column
+  order; (c) `Capabilities(StreamType.VIDEO, schema=VideoSchema(...))` is valid but pairing `VIDEO`
+  with an `AudioSchema` raises `ValueError`; (d) an empty `TabularSchema` (no columns) raises
+  `ValueError`.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/core/test_capabilities.py -v` → FAIL
+  (`cannot import name 'capabilities'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/core/capabilities.py` with the enum, three frozen schema
+  dataclasses (each with `to_dict`/`from_dict`), and `Capabilities` whose `__post_init__` enforces the
+  type↔schema match. No I/O.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/core/test_capabilities.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Capabilities: add StreamType and per-type payload schemas`.
+
+### Task 1.3 — `SensorDriver` abstract base (the plugin contract)
+
+**Files:** create `src/mmco/core/driver.py`, `tests/core/test_driver.py`. (Spec §3.1.)
+
+The plugin contract every driver implements: abstract `open()`, `read() -> DriverSample`, `close()`,
+property `capabilities -> Capabilities`, and `health() -> DriverHealth`. `health()` is a
+non-blocking heartbeat (a `DriverHealth` enum: `OK`, `DEGRADED`, `DOWN`) the driver reports — **never** a
+blocking call the core makes into a hung driver. Drivers return payload bytes only and **never touch
+shared memory** (the host copies); this is documented in the base class.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/core/test_driver.py` assert: (a) instantiating
+  `SensorDriver` directly raises `TypeError` (it is abstract); (b) a tiny in-test fake subclass that
+  implements every abstract member instantiates, and its `read()` returns a `DriverSample` while
+  `capabilities` returns a `Capabilities`; (c) a subclass that omits one abstract method cannot be
+  instantiated (`TypeError`).
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/core/test_driver.py -v` → FAIL
+  (`cannot import name 'driver'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/core/driver.py`: a `DriverHealth` enum and the
+  `SensorDriver` ABC (`abc.ABC` + `@abstractmethod`), with docstrings stating the heartbeat and
+  no-shared-memory rules.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/core/test_driver.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Driver Contract: add SensorDriver abstract base`.
+
+### Task 1.4 — Clock reference & latency-offset registry
+
+**Files:** create `src/mmco/core/clock.py`, `tests/core/test_clock.py`. (Spec §4.2.)
+
+A `MonotonicClock` wrapper (`now_ns()` over `time.monotonic_ns()`; `capture_anchor()` returning a
+`(monotonic_ns, wall_ns)` pair sampled once for the monotonic↔wall mapping) and an `OffsetRegistry`
+mapping `sensor_id → offset_ns` with `event_time(sensor_id, t_acquire_ns) = t_acquire_ns − offset`
+(`t_event = t_acquire − offset`, spec §4.2).
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/core/test_clock.py` assert: (a) an unknown
+  sensor's offset defaults to `0`, so `event_time` returns `t_acquire_ns` unchanged; (b) after setting
+  an offset, `event_time` subtracts it; (c) `capture_anchor()` returns two `int` ns values and
+  `now_ns()` is non-decreasing across two successive calls.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/core/test_clock.py -v` → FAIL
+  (`cannot import name 'clock'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/core/clock.py` with `MonotonicClock` and `OffsetRegistry`
+  (plain stdlib `time`; default offset `0`; pure arithmetic).
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/core/test_clock.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Clock: add monotonic clock and latency-offset registry`.
+
+### Task 1.6 — Error-code taxonomy *(built before 1.5 and 1.7)*
+
+**Files:** create `src/mmco/core/errors.py`, `tests/core/test_errors.py`. (Spec §6.)
+
+An `ErrorCode` enum giving each failure a stable generic code string and a default human message:
+`MMCO-E001` device-not-found, `E002` driver-crash, `E003` watchdog-timeout, `E004`
+device-disconnected, `E005` shm-buffer-full, `E006` config-invalid, `E007` writer-failure. Each member
+exposes `.code` (e.g. `"MMCO-E001"`) and `.message`, plus a `from_code(code_str)` lookup.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/core/test_errors.py` assert: (a) all members
+  have unique `.code` values and non-empty `.message`; (b) `ErrorCode.from_code("MMCO-E003")` returns
+  the watchdog-timeout member and an unknown string raises `ValueError`; (c) the seven `.code` strings
+  equal their exact stable literals (`"MMCO-E001"` … `"MMCO-E007"`).
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/core/test_errors.py -v` → FAIL
+  (`cannot import name 'errors'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/core/errors.py`: an `enum.Enum` whose members carry
+  `(code, message)`, with a `code`/`message` property pair and a `from_code` classmethod.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/core/test_errors.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Error Codes: add MMCO error-code taxonomy`.
+
+### Task 1.5 — Session manifest model *(depends on 1.2 + 1.6)*
+
+**Files:** create `src/mmco/core/manifest.py`, `tests/core/test_manifest.py`. (Spec §5.)
+
+Frozen dataclasses for the alignment contract: `Segment{file_path, start_timestamp, end_timestamp,
+block_index}`; `Gap{start, end, reason, code: ErrorCode}`; `StreamBlock{sensor_id, type: StreamType,
+capabilities: Capabilities, latency_offset, dropped: bool, segments: list[Segment], gaps:
+list[Gap]}`; and `SessionManifest{session_id, monotonic_wall_anchor, output_dir, streams:
+list[StreamBlock]}`. `segments[]` (not a single `file_path`) so a disconnect/reconnect is multiple
+files with the hole preserved as a gap. JSON (de)serialize via `to_dict`/`from_dict` + `to_json`/
+`from_json`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/core/test_manifest.py` assert: (a) a manifest
+  with one stream, two `Segment`s and one `Gap` survives `to_json` → `from_json` equal to the original;
+  (b) segment and gap **order is preserved**; (c) the serialized dict has the expected top-level keys
+  and per-stream keys, and `gap.code` serializes to its stable `ErrorCode` code string and round-trips
+  back to the `ErrorCode` member.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/core/test_manifest.py -v` → FAIL
+  (`cannot import name 'manifest'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/core/manifest.py` with the four frozen dataclasses and
+  symmetric `to_dict`/`from_dict` (+ `to_json`/`from_json` using stdlib `json`); serialize `StreamType`
+  by name and `ErrorCode` by its `.code` string.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/core/test_manifest.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Manifest: add session manifest model with JSON round-trip`.
+
+### Task 1.7 — Log-event model *(depends on 1.6)*
+
+**Files:** create `src/mmco/core/logevent.py`, `tests/core/test_logevent.py`. (Spec §6.)
+
+A `LogLevel` ordered enum (`DEBUG < INFO < WARNING < ERROR`) and a `LogEvent{t_ns, level: LogLevel,
+message, code: ErrorCode | None = None, sensor_id: str | None = None, extra: dict}` — the shared shape
+every component emits — with one-line JSONL `to_json`/`from_json`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/core/test_logevent.py` assert: (a) a `LogEvent`
+  (including a non-empty `extra` dict) survives `to_json` → `from_json` equal to the original; (b) a
+  `code` serializes to its stable `ErrorCode` string and round-trips, while an absent code serializes
+  to JSON `null` and round-trips back to `None`; (c) `LogLevel` ordering lets you filter a list of
+  events to those at/above a threshold (e.g. `>= WARNING`).
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/core/test_logevent.py -v` → FAIL
+  (`cannot import name 'logevent'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/core/logevent.py`: an ordered `LogLevel` (e.g. `IntEnum`),
+  the frozen `LogEvent` dataclass, and JSONL `to_json`/`from_json` handling the optional `code` and
+  `sensor_id`.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/core/test_logevent.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Log Events: add structured LogEvent with JSONL round-trip`.
+
+### Task 1.8 — Phase 1 gate
+
+- [ ] **Step 1 — Full suite + lint.** `python -m pytest` → all phase 0 + phase 1 tests green;
+  `python -m ruff check .` → `All checks passed!`.
+- [ ] **Step 2 — Update README.** Flip the Phase 1 row to ✅ and the Phase 2 row to 🔜; refresh the
+  test count and "Current stage" line.
+- [ ] **Step 3 — Commit.** Message: `Docs: mark Phase 1 complete in progress README`.
+
+**Files (Phase 1 total):** `src/mmco/core/{__init__,events,capabilities,driver,clock,errors,manifest,
+logevent}.py`; matching `tests/core/test_*.py` (+ `tests/core/__init__.py`).
+
+**Outcome:** A fully unit-tested pure core — value types, capability/schema descriptors, the driver
+contract, clock/offset math, the error-code taxonomy, the session-manifest model, and the log-event
+shape — all stdlib, no processes or hardware. Everything later phases build on is now type-checked and
+round-trip tested.
 
 ---
 
