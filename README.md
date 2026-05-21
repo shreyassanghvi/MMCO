@@ -16,9 +16,11 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** design + plan approved; implementation not yet started.
+**Current stage:** Phase 0 complete (scaffolding green); Phase 1 next.
 **Active branch:** `impl/phase-0-scaffolding` (off `master`).
 **Last updated:** 2026-05-21.
+
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 4 passing.
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -30,8 +32,8 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 |---|---|---|
 | —  | Design spec (reviewed by two agents) | ✅ Done |
 | —  | Phased implementation plan | ✅ Done |
-| 0  | Project scaffolding & tooling | 🔜 Expanded into TDD steps; awaiting build |
-| 1  | Core types, contracts & error codes (pure) | ⬜ Not started |
+| 0  | Project scaffolding & tooling | ✅ Done — package, tooling, paths; 4 tests green |
+| 1  | Core types, contracts & error codes (pure) | 🔜 Next |
 | 2  | Event bus transport | ⬜ Not started |
 | 3  | Simulated driver + driver host | ⬜ Not started |
 | 4  | Recorder + writers + manifest | ⬜ Not started |
