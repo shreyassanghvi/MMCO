@@ -16,11 +16,11 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 2 complete (event bus green); Phase 3 next.
-**Active branch:** `impl/phase-2-event-bus` (off `master`).
+**Current stage:** Phase 3 complete (cross-process path green); Phase 4 next.
+**Active branch:** `impl/phase-3-sim-driver` (off `master`).
 **Last updated:** 2026-05-21.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 49 passing
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 60 passing
 (1 skipped: a POSIX-only shared-memory sweep test, skipped on Windows).
 
 ### Documents
@@ -36,8 +36,8 @@ Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` �
 | 0  | Project scaffolding & tooling | ✅ Done — package, tooling, paths; 4 tests green |
 | 1  | Core types, contracts & error codes (pure) | ✅ Done — events, capabilities, driver ABC, clock, errors, manifest, log events |
 | 2  | Event bus transport | ✅ Done — shared-memory ring, metadata queue, gen-checked producer/consumer |
-| 3  | Simulated driver + driver host | 🔜 Next |
-| 4  | Recorder + writers + manifest | ⬜ Not started |
+| 3  | Simulated driver + driver host | ✅ Done — sim driver, control/log channels, cross-process host |
+| 4  | Recorder + writers + manifest | 🔜 Next |
 | 5  | Supervisor: health & graceful degradation | ⬜ Not started |
 | 6  | Session log + auto-summary | ⬜ Not started |
 | 7  | Control surface: config, CLI, live status | ⬜ Not started |
@@ -46,6 +46,16 @@ Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` �
 | 10 | Containerization & one-command launch | ⬜ Not started |
 
 Legend: ✅ done · 🔜 next up · ⬜ not started
+
+### Known follow-ups
+
+- **Linux multiprocessing validation (Phase 3).** Development is on Windows, where `spawn` is the
+  default start method. The driver host spawns its child via `get_context("spawn")`, but the bus/log
+  queues and the stop event are created from the default context. On Windows these coincide; on the
+  Linux/WSL2 **runtime target** (default `fork`) this mixing must be verified — and if needed, all
+  `multiprocessing` objects should be created from a single shared `spawn` context. Run the full suite
+  (especially `tests/host/`) under WSL2/Linux and confirm green before relying on the cross-process
+  path there.
 
 ---
 

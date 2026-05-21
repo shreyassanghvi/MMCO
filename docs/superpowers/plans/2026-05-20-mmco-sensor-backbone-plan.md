@@ -473,25 +473,127 @@ Phase 3).
 **Goal:** Stand up the real cross-process acquisition path with a deterministic driver that doubles as
 the primary test fixture.
 
-**Tasks**
-- **3.1 Simulated sensor driver** — deterministic tabular stream at a configured rate; **injectable
-  failure modes** (crash, hang, slow) via config, used heavily in Phase 5. *Tested by:* emits expected
-  values/rate; failure modes trigger on cue.
-- **3.2 Driver host (process wrapper)** — generic runner that loads one driver, runs the acquisition
-  loop, stamps `t_acquire` at the read, **copies the driver-returned payload into the ring** (driver
-  never touches shm), pushes via `BusProducer`, and **emits `LogEvent`s** for open/close/error
-  (carrying an `ErrorCode` on failure). *Tested by:* host run in a child process; core `BusConsumer`
-  receives correctly stamped events; payload copied by host; lifecycle log events captured; clean
-  shutdown on stop.
-- **3.3 Control + log channel** — per-driver control channel (stop/flush) from core to host, and a log
-  channel back so the core collects each host's `LogEvent`s. *Tested by:* stop signal terminates the loop
-  promptly; no orphaned shared memory; log events delivered to the core.
+**Branch:** `impl/phase-3-sim-driver` (off `master`, after Phase 2 merge).
 
-**Files:** `src/mmco/drivers/simulated.py`, `src/mmco/host/driver_host.py`, `host/control.py`;
-`tests/drivers/test_simulated.py`, `tests/host/test_driver_host.py`.
+**Design decisions (locked for this phase):**
+- **Start method `spawn`.** Set `multiprocessing.set_start_method("spawn")` (Windows' default; pin it
+  so Linux behaves identically). Consequence: every `Process` target is a **module-level function** in
+  `src/` (never a closure or test-local function — spawn re-imports the module), and all args must be
+  ForkingPickler-safe.
+- **Ownership / wiring.** The **core** creates the `RingBuffer` (owner), the meta `MetaQueue`, a log
+  channel, and a stop signal, then spawns the host as a child `Process` running
+  `run_driver_host(...)`, passing the ring **name + dims** and the queues/stop as `Process` args. The
+  host **attaches** the ring by name (never creates/unlinks), builds a `BusProducer`, and on exit
+  detaches; the core `unlink()`s the segment.
+- **Driver never touches shm.** The host stamps `t_acquire = clock.now_ns()` at the read, **copies**
+  the driver-returned `DriverSample.payload` into the ring via `BusProducer`, and paces to the
+  driver's nominal rate. Each process uses its own `MonotonicClock` (cross-process clock offset is out
+  of scope per spec §10; alignment is validated within tolerance in the Phase 9 slice).
+- **Everything is observable.** The host emits `LogEvent`s for `open` / `close` / `error` on the log
+  channel; a driver `read()` that raises becomes a `LogEvent(code=ErrorCode.DRIVER_CRASH)` and the host
+  exits cleanly.
+- **Build order:** 3.1 → **3.3 → 3.2** → 3.4 (the control + log channel primitives are built before the
+  host loop that consumes them).
+- **Test hygiene.** Tests spawn **real child processes**, bounded by consuming a fixed number of events
+  then requesting stop with a `join(timeout)`; timing assertions use generous timeouts to avoid
+  flakiness; the no-orphaned-segment check is Linux-only (`skipif(win32)`). Commands run via the
+  project venv interpreter.
 
-**Outcome:** A driver-host process emits stamped events (and log events) onto the bus and the core drains
-them across a real process boundary.
+### Task 3.1 — Simulated sensor driver
+
+**Files:** create `src/mmco/drivers/__init__.py`, `src/mmco/drivers/simulated.py`,
+`tests/drivers/__init__.py`, `tests/drivers/test_simulated.py`. (Spec §3.1, §9.)
+
+A `SimulatedDriver(SensorDriver)` producing a **deterministic** tabular stream: each `read()` returns a
+`DriverSample` whose payload is the current sample index packed with `struct` (schema ref `"sim.v1"`),
+and `capabilities` is a `TABULAR` `Capabilities` at the configured rate with a one-column
+`TabularSchema`. A `SimConfig` (frozen) carries `sensor_id`, `rate_hz`, and an optional **failure
+mode** — `crash` (raise after N reads), `slow` (sleep `delay_s` per read), or `hang` (block in `read()`
+until `close()` releases it, so tests never dangle) plus `failure_after`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/drivers/test_simulated.py` assert: (a)
+  `capabilities` is `TABULAR` at `rate_hz` with the expected single-column schema; (b) successive
+  `read()`s return payloads that decode to a strictly increasing counter `0, 1, 2, …`; (c) with
+  `failure="crash", failure_after=3`, the first three reads succeed and the fourth raises; (d) with
+  `failure="slow", delay_s=…`, a `read()` takes at least `delay_s` (measured); (e) with
+  `failure="hang"`, a `read()` called on a worker thread is still alive after a short wait and returns
+  only after `close()` releases it (thread joins).
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/drivers/test_simulated.py -v` → FAIL
+  (`No module named 'mmco.drivers'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/drivers/__init__.py`, `src/mmco/drivers/simulated.py` with
+  `SimConfig`, the `SimulatedDriver` (counter payload via `struct`; `health()` returns
+  `DriverHealth.OK`; `hang` waits on a `threading.Event` that `close()` sets). Add empty
+  `tests/drivers/__init__.py`.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/drivers/test_simulated.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message:
+  `Simulated Driver: add deterministic tabular sim with injectable failure modes`.
+
+### Task 3.3 — Control + log channels *(built before the host)*
+
+**Files:** create `src/mmco/host/__init__.py`, `src/mmco/host/control.py`,
+`tests/host/__init__.py`, `tests/host/test_control.py`. (Spec §3.1.)
+
+Two thin, picklable channels the core hands a host. `Control` wraps a `multiprocessing.Event` with
+`request_stop()` and `stop_requested() -> bool`. `LogChannel` wraps a `multiprocessing.Queue` of
+`LogEvent`s with non-blocking `emit(event) -> bool` (host side) and `drain(timeout) -> list[LogEvent]`
+(core side).
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/host/test_control.py` assert: (a) a fresh
+  `Control` reports `stop_requested()` is `False`, and `True` after `request_stop()`; (b) `LogChannel`
+  round-trips a `LogEvent` (including its `code`) through `emit` then `drain`; (c) `drain` on an empty
+  channel returns `[]` within the timeout; (d) `drain` returns multiple emitted events in FIFO order.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/host/test_control.py -v` → FAIL
+  (`No module named 'mmco.host'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/host/__init__.py`, `src/mmco/host/control.py` with
+  `Control` (over `mp.Event`) and `LogChannel` (over `mp.Queue`, non-blocking `emit`, `drain` that
+  collects until empty or timeout). Add empty `tests/host/__init__.py`.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/host/test_control.py -v` → pass.
+- [ ] **Step 5 — Commit.** Message: `Control Channel: add stop signal and log channel for driver hosts`.
+
+### Task 3.2 — Driver host (cross-process acquisition runner)
+
+**Files:** create `src/mmco/host/driver_host.py`, `tests/host/test_driver_host.py`. (Spec §3.1, §4.1.)
+
+A module-level `run_driver_host(config, ring_name, n_slots, slot_size, metaqueue, control, log_channel)`
+(the spawn target) that attaches the ring, builds a `BusProducer`, emits an `open` `LogEvent`, then
+loops: `read()` the driver → stamp `t_acquire` → `publish` → pace to `rate_hz`, checking
+`control.stop_requested()` each iteration; on a driver exception it emits
+`LogEvent(code=ErrorCode.DRIVER_CRASH)` and exits; on stop it `close()`s the driver, emits a `close`
+`LogEvent`, and detaches the ring. A small `spawn_driver_host(...)` core-side helper wires the ring +
+queues and returns the started `Process`.
+
+- [ ] **Step 1 — Write the failing tests.** In `tests/host/test_driver_host.py` (using a
+  `SimulatedDriver` config) assert: (a) with the host running in a real child process, a core
+  `BusConsumer` polls **correctly stamped** events — `t_acquire_ns` is positive and non-decreasing and
+  payloads decode to the expected `0, 1, 2, …` counter; (b) the `LogChannel` yields an `open` event at
+  startup and a `close` event after stop; (c) requesting stop makes the child exit and
+  `process.join(timeout)` succeeds (the process is no longer alive); (d) with a `crash`-mode sim, the
+  core receives the pre-crash events followed by a `LogEvent` carrying `ErrorCode.DRIVER_CRASH`, and
+  the child exits.
+- [ ] **Step 2 — Run; confirm RED.** `python -m pytest tests/host/test_driver_host.py -v` → FAIL
+  (`cannot import name 'driver_host'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/host/driver_host.py` with `run_driver_host` and
+  `spawn_driver_host`; pin the start method to `spawn`; ensure clean teardown (driver `close()`, ring
+  detach) on both stop and crash paths.
+- [ ] **Step 4 — Run; confirm GREEN.** `python -m pytest tests/host/test_driver_host.py -v` → pass
+  (allow generous join timeouts). Confirm no segment is leaked after the test (the core `unlink()`s).
+- [ ] **Step 5 — Commit.** Message:
+  `Driver Host: add cross-process acquisition runner emitting stamped events`.
+
+### Task 3.4 — Phase 3 gate
+
+- [ ] **Step 1 — Full suite + lint.** `python -m pytest` → all phases green (Linux-only checks skip on
+  Windows); `python -m ruff check .` (verify exit code `0`) → `All checks passed!`.
+- [ ] **Step 2 — Update README.** Flip the Phase 3 row to ✅ and the Phase 4 row to 🔜; refresh the
+  test count and "Current stage" line.
+- [ ] **Step 3 — Commit.** Message: `Docs: mark Phase 3 complete in progress README`.
+
+**Files (Phase 3 total):** `src/mmco/drivers/{__init__,simulated}.py`,
+`src/mmco/host/{__init__,control,driver_host}.py`; matching `tests/drivers/` + `tests/host/` modules.
+
+**Outcome:** A driver-host process emits stamped events (and log events) onto the bus and the core
+drains them across a real process boundary, with clean shutdown on stop and an error-coded log event on
+driver crash.
 
 ---
 
