@@ -941,20 +941,92 @@ are logged, the driver auto-reconnects (by stable identity) into a new segment. 
 happened and a human-readable summary, with error codes that hint at any failures. This is the
 "less documenting, less debugging" payoff.
 
-**Tasks**
-- **6.1 Session log writer** — append all collected `LogEvent`s to `session.log.jsonl` for the session
-  (lifecycle, drops, gaps, reconnects, errors-with-codes), flushed on stop. *Tested by:* a session's log
-  events land in JSONL in order; codes preserved; file re-readable.
-- **6.2 Summary generator** — read `manifest.json` + `session.log.jsonl` and write a readable
-  `summary.md`: streams captured, durations, sample counts, gaps/reconnects with their error codes and
-  plain-English meaning, and cross-stream alignment quality. *Tested by:* summary lists every stream,
-  reflects injected gaps with the correct code + message, and is generated without manual input.
-- **6.3 Wire into session lifecycle** — recorder/supervisor finalize all three artifacts (manifest, log,
-  summary) on stop. *Tested by:* integration test — a degraded simulated session yields manifest + log +
-  summary, and the summary's reported failure matches the injected fault's error code.
+**Branch:** `impl/phase-6-session-log` (off `master`, after Phase 5 merge).
 
-**Files:** `src/mmco/record/session_log.py`, `record/summary.py`; `tests/record/test_session_log.py`,
-`tests/record/test_summary.py`, `tests/integration/test_self_documenting_session.py`.
+**Design decisions (locked for this phase):**
+- **The supervisor already aggregates `LogEvent`s** (`aggregated_logs`); Phase 6 just persists them and
+  renders them. No new acquisition logic.
+- **Session log = JSONL of the aggregated events**, in order, one `LogEvent.to_json()` per line. Pure
+  stdlib (the model already round-trips). A `read_log` helper parses it back for the summary + tests.
+- **Summary is generated purely from `manifest.json` + `session.log.jsonl`** — no hardware, no parquet
+  reads. Per-stream it reports: type + nominal rate, segment count, captured span (first segment start
+  → last segment end), an **approximate** sample count (`span_s × rate`, labelled approximate so it is
+  not mistaken for an exact row count), and `dropped`. Gaps/reconnects are rendered in plain English
+  with their `MMCO-Exxx` code + default message (from the `ErrorCode` taxonomy).
+- **Cross-stream alignment** is reported modestly: the monotonic↔wall anchor is shown and a note says
+  strict ±2 ms alignment validation lands with the webcam slice (Phase 9) — no overclaiming.
+- The supervisor writes all three artifacts under `recordings/<session_id>/` using `mmco.paths`.
+- **Build order:** 6.1 session log → 6.2 summary → 6.3 wire into the supervisor + integration → gate.
+- Commands via the venv interpreter; ruff exit code checked directly.
+
+### Task 6.1 — Session-log writer/reader
+
+**Files:** create `src/mmco/record/session_log.py`, `tests/record/test_session_log.py`. (Spec §6.)
+
+`write_log(path, events)` writes a list of `LogEvent`s to `session.log.jsonl` (one JSON object per
+line, in order); `read_log(path) -> list[LogEvent]` parses it back.
+
+- [ ] **Step 1 — Failing tests.** Under `tmp_path`: writing several `LogEvent`s (including ones
+  carrying an `ErrorCode`) then `read_log` returns them **equal and in order**; the file has one line
+  per event; an event's `code` survives the round-trip.
+- [ ] **Step 2 — RED.** `python -m pytest tests/record/test_session_log.py -v` → FAIL (`No module named
+  'mmco.record.session_log'`).
+- [ ] **Step 3 — Implement.** Add `session_log.py` with `write_log`/`read_log` over
+  `LogEvent.to_json`/`from_json`.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Session Log: write and read session.log.jsonl`.
+
+### Task 6.2 — Summary generator
+
+**Files:** create `src/mmco/record/summary.py`, `tests/record/test_summary.py`. (Spec §6.)
+
+`render_summary(manifest: SessionManifest, events: list[LogEvent]) -> str` builds the markdown;
+`write_summary(session_dir) -> Path` reads `manifest.json` + `session.log.jsonl` from a session dir and
+writes `summary.md`. The summary lists every stream (type, rate, segments, span, approx samples,
+dropped) and renders each gap in plain English with its code + message.
+
+- [ ] **Step 1 — Failing tests.** Build a `SessionManifest` with one stream that has a segment and a
+  `Gap` coded `ErrorCode.DEVICE_DISCONNECTED`, plus a couple of `LogEvent`s. Assert `render_summary`:
+  contains the `session_id` and the `sensor_id`; reflects the gap with **both** the code string
+  (`MMCO-E004`) and its plain-English message (`device disconnected`); reports the segment count; and
+  is produced from the objects alone (no I/O, no manual input). Then assert `write_summary(session_dir)`
+  writes a non-empty `summary.md` that contains the same.
+- [ ] **Step 2 — RED.** `python -m pytest tests/record/test_summary.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `summary.py` (`render_summary` pure; `write_summary` reads the two
+  artifacts via `SessionManifest.from_json` + `read_log` and writes `summary.md`).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Summary: generate human-readable summary.md from manifest + log`.
+
+### Task 6.3 — Wire into the session lifecycle + integration
+
+**Files:** modify `src/mmco/supervisor/supervisor.py` (write log + summary on stop); create
+`tests/integration/test_self_documenting_session.py`. (Spec §6.)
+
+`Supervisor.stop` already writes `manifest.json` (via the recorder). Extend it to also
+`write_log(session_log_path, self.aggregated_logs)` and `write_summary(session_dir)` so every session
+leaves all three artifacts.
+
+- [ ] **Step 1 — Failing integration test.** Run a supervised session with a `disconnect`-mode sim (so
+  a real fault occurs), stop, and assert: `manifest.json`, `session.log.jsonl`, and `summary.md` all
+  exist under `recordings/<session_id>/`; `read_log` re-reads the log with the fault's code present; and
+  the `summary.md` text names the injected fault's code (`MMCO-E004`) and its plain-English message.
+- [ ] **Step 2 — RED.** `python -m pytest tests/integration/test_self_documenting_session.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** In `Supervisor.stop`, after the recorder writes the manifest, write the
+  log and the summary into the session dir (paths from `mmco.paths`).
+- [ ] **Step 4 — GREEN.** pass (generous timeouts; real child processes).
+- [ ] **Step 5 — Commit.** `Supervisor: finalize manifest + log + summary on stop`.
+
+### Task 6.4 — Phase 6 gate
+
+- [ ] **Step 1 — Full suite + lint.** `python -m pytest` → all green (Linux-only checks skip on
+  Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 2 — Update README.** Flip Phase 6 to ✅, Phase 7 to 🔜; refresh test count + stage line;
+  note every session auto-produces manifest + log + summary.
+- [ ] **Step 3 — Commit.** `Docs: mark Phase 6 complete in progress README`.
+
+**Files (Phase 6 total):** `src/mmco/record/{session_log,summary}.py`; extension to
+`supervisor/supervisor.py`; `tests/record/test_session_log.py`, `tests/record/test_summary.py`,
+`tests/integration/test_self_documenting_session.py`.
 
 **Outcome:** Every session auto-produces `manifest.json` + `session.log.jsonl` + `summary.md`. Inject a
 fault → the summary names what failed in plain English with its error code. No hand-documentation.
