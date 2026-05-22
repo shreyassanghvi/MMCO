@@ -30,13 +30,15 @@ class Recorder:
     def __init__(
         self,
         *,
-        consumer: BusConsumer,
         capabilities: dict[str, Capabilities],
         offsets: OffsetRegistry,
         session_id: str,
         base_dir: Path,
         anchor: ClockAnchor,
+        consumer: BusConsumer | None = None,
     ):
+        # ``consumer`` is optional: a single-stream caller uses ``record_available`` to poll it,
+        # while the supervisor owns per-sensor consumers and feeds events via ``record``.
         self._consumer = consumer
         self._capabilities = capabilities
         self._offsets = offsets
@@ -51,6 +53,7 @@ class Recorder:
         self._registered: set[str] = set()
         self._seen: set[str] = set()
         self._failed: set[str] = set()
+        self._dropped: dict[str, int] = {}
 
     def start(self) -> None:
         """Create the session directory."""
@@ -98,14 +101,10 @@ class Recorder:
                 ),
             )
 
-    def record_available(self, timeout: float = 0.0) -> bool:
-        """Poll once; route and write one event if present. Return whether one was recorded."""
-        result = self._consumer.poll(timeout=timeout)
-        if result is None:
-            return False
-        meta, payload = result
+    def record(self, meta, payload: bytes) -> None:
+        """Route and write one already-polled event (used by the supervisor's per-sensor loop)."""
         if meta.sensor_id in self._failed:
-            return True  # stream settled into a gap; drain but don't record
+            return  # stream settled into a gap; ignore further events
         t_event = self._offsets.event_time(meta.sensor_id, meta.t_acquire_ns)
         try:
             self._writer_for(meta.sensor_id).write_event(t_event, payload)
@@ -119,7 +118,19 @@ class Recorder:
                 code=ErrorCode.WRITER_FAILURE,
             )
             self._failed.add(meta.sensor_id)
+
+    def record_available(self, timeout: float = 0.0) -> bool:
+        """Poll the consumer once; record one event if present. Return whether one was recorded."""
+        result = self._consumer.poll(timeout=timeout)
+        if result is None:
+            return False
+        meta, payload = result
+        self.record(meta, payload)
         return True
+
+    def note_dropped(self, sensor_id: str, dropped: int) -> None:
+        """Record a stream's dropped-event count (the supervisor supplies it per sensor)."""
+        self._dropped[sensor_id] = dropped
 
     def open_gap(
         self, sensor_id: str, *, start: int, end: int, reason: str, code: ErrorCode
@@ -135,11 +146,14 @@ class Recorder:
         """Close writers, finalize segments + drops, and write ``manifest.json``."""
         for sensor_id in list(self._writers):
             self._finalize_writer(sensor_id)
-        # Single-stream sessions can attribute the consumer's drops to that stream;
-        # per-sensor drop attribution for multi-stream sessions arrives later.
-        if len(self._seen) == 1:
+        # Drops supplied explicitly per sensor (supervisor) win; otherwise a single-stream
+        # session backed by a consumer attributes that consumer's drops to its one stream.
+        if not self._dropped and self._consumer is not None and len(self._seen) == 1:
             only = next(iter(self._seen))
-            self._author.set_dropped(only, self._consumer.dropped)
+            self._dropped[only] = self._consumer.dropped
+        for sensor_id, dropped in self._dropped.items():
+            if sensor_id in self._registered:
+                self._author.set_dropped(sensor_id, dropped)
         path = manifest_path(self._session_dir)
         self._author.write(str(path))
         return path
