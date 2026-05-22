@@ -5,7 +5,7 @@ import time
 import pytest
 
 from mmco.core.capabilities import StreamType
-from mmco.core.driver import DriverHealth
+from mmco.core.driver import DeviceDisconnectedError, DriverHealth
 from mmco.drivers.simulated import SimConfig, SimulatedDriver
 
 
@@ -38,6 +38,17 @@ def test_crash_mode_raises_after_n_reads():
         driver.read()  # first three succeed
     with pytest.raises(RuntimeError):
         driver.read()  # fourth raises
+
+
+def test_disconnect_mode_raises_device_disconnected_after_n_reads():
+    driver = SimulatedDriver(
+        SimConfig(sensor_id="sim0", rate_hz=100.0, failure="disconnect", failure_after=2)
+    )
+    driver.open()
+    driver.read()
+    driver.read()  # first two succeed
+    with pytest.raises(DeviceDisconnectedError):
+        driver.read()  # third signals device-gone
 
 
 def test_slow_mode_delays_each_read():

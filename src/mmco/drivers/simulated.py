@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 
 from mmco.core.capabilities import Capabilities, Column, StreamType, TabularSchema
-from mmco.core.driver import DriverHealth, SensorDriver
+from mmco.core.driver import DeviceDisconnectedError, DriverHealth, SensorDriver
 from mmco.core.events import DriverSample
 
 _SCHEMA_REF = "sim.v1"
@@ -48,6 +48,8 @@ class SimulatedDriver(SensorDriver):
         cfg = self._config
         if cfg.failure == "crash" and self._index >= cfg.failure_after:
             raise RuntimeError(f"simulated driver crash at read {self._index}")
+        if cfg.failure == "disconnect" and self._index >= cfg.failure_after:
+            raise DeviceDisconnectedError(f"simulated device gone at read {self._index}")
         if cfg.failure == "slow":
             time.sleep(cfg.delay_s)
         if cfg.failure == "hang" and self._index >= cfg.failure_after:
