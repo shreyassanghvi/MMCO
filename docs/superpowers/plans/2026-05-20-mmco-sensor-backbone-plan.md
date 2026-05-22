@@ -1037,26 +1037,124 @@ fault → the summary names what failed in plain English with its error code. No
 
 **Goal:** Let an operator drive and observe the box.
 
-**Tasks**
-- **7.1 Config model + YAML loader** — `sensors.yaml` → session config (sensors, drivers, recording
-  profiles, output dir). *Tested by:* valid config parses; bad config gives a clear error with
-  `E006 config-invalid`.
-- **7.2 Recording profiles (per protocol + per-sensor override)** — `recording_profiles` give
-  protocol-level defaults (e.g. `v4l2: {container, codec, crf}`, `alsa`, `serial`); a sensor's
-  `profile_override` wins over its protocol default. Resolved at session start (spec §5.1). *Tested by:*
-  protocol default applied; per-sensor override beats default; missing-key falls back; one non-default
-  profile (`crf` override) resolves as expected.
-- **7.3 CLI `run` / `stop`** — `mmco run <config>` boots supervisor+recorder; `mmco stop` ends the
-  session and finalizes manifest + log + summary. *Tested by:* CLI invocation runs a short session and
-  finalizes all artifacts (using sim driver).
-- **7.4 Live status table** — render sensors, rate/fps, dropped frames, reconnect events, last error
-  code; `mmco status`. *Tested by:* status snapshot reflects live counters (rendered from a fake
-  supervisor state).
+**Branch:** `impl/phase-7-control-surface` (off `master`, after Phase 6 merge).
 
-**Files:** `src/mmco/config/config.py`, `config/profiles.py`, `src/mmco/cli/main.py`,
-`cli/status_view.py`; `tests/config/test_*.py`, `tests/cli/test_*.py`.
+**Design decisions (locked for this phase):**
+- **New runtime dependency: `PyYAML`** (config parsing). Added to `[project.dependencies]`; installed
+  into the venv in Task 7.1.
+- **Console entry point.** Add `[project.scripts]` `mmco = "mmco.cli.main:main"` so `mmco run …` works
+  after `pip install -e .`. The CLI uses stdlib `argparse`.
+- **Sim-only driver registry this phase.** The CLI maps a config's `driver` name to a builder that
+  produces a `SensorSpec` (factory + driver config + capabilities). Only `"simulated"` is wired now; a
+  general entry-point plugin registry (real drivers ship driver + writer together) is **Phase 8** — the
+  registry here is a small dict, noted as the seam.
+- **Single-process `run` with graceful finalize — detached `stop`/`status` deferred.** `mmco run`
+  boots the supervisor, ticks the session, and **finalizes manifest + log + summary on completion or
+  `KeyboardInterrupt`/`SIGINT`**. A *detached* `mmco stop` / `mmco status` against a separate running
+  daemon needs an IPC channel (socket/pidfile) that is out of scope here; this is **flagged as a
+  deviation** from the spec's task wording. For testability, `run` accepts a bounded duration. The
+  status **renderer** is built and unit-tested now (and shown during `run`); the cross-process `status`
+  *command* lands when the daemon/IPC arrives.
+- **Build order:** 7.1 config → 7.2 profiles → 7.3 CLI run → 7.4 status renderer → 7.5 gate.
+- Commands via the venv interpreter; ruff exit code checked directly.
 
-**Outcome:** `mmco run sensors.yaml` records with a live status table; `mmco status` shows live state.
+### Task 7.1 — Config model + YAML loader
+
+**Files:** modify `pyproject.toml` (add `PyYAML`); create `src/mmco/config/__init__.py`,
+`src/mmco/config/config.py`, `tests/config/test_config.py`. (Spec §5.1, §7.)
+
+`SensorConfig` (`id`, `driver`, `identity`, `rate_hz`, `protocol`, `profile_override: dict`) and
+`SessionConfig` (`output_dir`, `sensors: list[SensorConfig]`, `recording_profiles: dict`). A
+`ConfigError(Exception)` carrying `ErrorCode.CONFIG_INVALID`. `load_config(path) -> SessionConfig`
+parses `sensors.yaml` with PyYAML and validates.
+
+- [ ] **Step 1 — Add the dependency.** Add `PyYAML` to `[project.dependencies]`; run
+  `python -m pip install -e ".[dev]"`.
+- [ ] **Step 2 — Failing tests.** With a valid `sensors.yaml` written under `tmp_path`: `load_config`
+  returns a `SessionConfig` with the expected `output_dir` and one `SensorConfig` (id/driver/rate
+  populated, `profile_override` captured). A config missing a required field (e.g. a sensor with no
+  `id`) raises `ConfigError` whose `.code is ErrorCode.CONFIG_INVALID`. Malformed YAML also raises
+  `ConfigError`.
+- [ ] **Step 3 — RED.** `python -m pytest tests/config/test_config.py -v` → FAIL (`No module named
+  'mmco.config'`).
+- [ ] **Step 4 — Implement.** Add `config/__init__.py`, `config/config.py` with the dataclasses,
+  `ConfigError`, and `load_config` (PyYAML `safe_load`; validate required keys; wrap parse/validation
+  errors as `ConfigError(code=E006)`).
+- [ ] **Step 5 — GREEN.** pass.
+- [ ] **Step 6 — Commit.** `Config: add session config model and YAML loader with E006 validation`.
+
+### Task 7.2 — Recording-profile resolution
+
+**Files:** create `src/mmco/config/profiles.py`, `tests/config/test_profiles.py`. (Spec §5.1.)
+
+`resolve_profile(recording_profiles: dict, protocol: str, override: dict | None) -> dict` returns the
+protocol's default profile merged with the per-sensor `override` (override wins per key; absent keys
+fall back to the protocol default; unknown protocol → `override` alone or `{}`).
+
+- [ ] **Step 1 — Failing tests.** Using the spec §5.1 example (`v4l2: {container: mp4, codec: h264,
+  crf: 23}` …): the protocol default is applied when there is no override; a sensor's `crf: 18`
+  override **beats** the default while the other keys (`container`, `codec`) fall back to the default;
+  an unknown protocol with no override yields `{}`.
+- [ ] **Step 2 — RED.** `python -m pytest tests/config/test_profiles.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `profiles.py` with the pure dict merge.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Profiles: resolve recording profiles with per-sensor overrides`.
+
+### Task 7.3 — CLI `run`
+
+**Files:** create `src/mmco/cli/__init__.py`, `src/mmco/cli/main.py`, `tests/cli/test_run.py`.
+(Spec §7.)
+
+A small `simulated`-only driver registry maps a `SensorConfig` to a `SensorSpec`. `run_session(config,
+*, max_seconds)` builds the specs, runs a `Supervisor` (tick loop bounded by `max_seconds`), and
+finalizes on exit. `main(argv)` is the `argparse` entry point: `mmco run <config> [--seconds N]`.
+
+- [ ] **Step 1 — Failing test.** Write a `sensors.yaml` with one `simulated` sensor under `tmp_path`;
+  call `main(["run", str(cfg), "--seconds", "1"])` (or `run_session` directly). Assert the session
+  finalized all three artifacts under `recordings/<session_id>/` (`manifest.json`, `session.log.jsonl`,
+  `summary.md`) and that the process exited cleanly (real child sim host).
+- [ ] **Step 2 — RED.** `python -m pytest tests/cli/test_run.py -v` → FAIL (`No module named
+  'mmco.cli'`).
+- [ ] **Step 3 — Implement.** Add `cli/__init__.py`, `cli/main.py` with the driver registry,
+  `run_session`, and `main` (argparse subcommand `run`; graceful finalize on `KeyboardInterrupt`). Wire
+  the `[project.scripts]` entry in `pyproject.toml`.
+- [ ] **Step 4 — GREEN.** pass (generous bound).
+- [ ] **Step 5 — Commit.** `CLI: add 'mmco run' to record a configured session`.
+
+### Task 7.4 — Live status renderer
+
+**Files:** create `src/mmco/cli/status_view.py`, `tests/cli/test_status_view.py`; extend
+`src/mmco/supervisor/supervisor.py` with `snapshot()`. (Spec §7.)
+
+`Supervisor.snapshot() -> list[dict]` reports per-sensor live counters (`sensor_id`, `alive`,
+`dropped`, `reconnects`, `last_code`). `render_status(snapshot) -> str` renders a readable text table
+(sensor, alive, dropped, reconnects, last error code).
+
+- [ ] **Step 1 — Failing tests.** `render_status` of a fabricated snapshot (one healthy stream, one
+  with a `last_code` of `MMCO-E004` and a reconnect) contains each sensor id, the dropped/reconnect
+  counts, and the `MMCO-E004` code; an empty snapshot still renders a header without raising. Also: a
+  started supervisor's `snapshot()` lists every sensor with the expected keys.
+- [ ] **Step 2 — RED.** `python -m pytest tests/cli/test_status_view.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `Supervisor.snapshot()`; add `status_view.py` with `render_status`.
+  Have `run_session` print the table periodically (best-effort; not asserted).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Status View: render live per-sensor status table`.
+
+### Task 7.5 — Phase 7 gate
+
+- [ ] **Step 1 — Full suite + lint.** `python -m pytest` → all green (Linux-only checks skip on
+  Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 2 — Update README.** Flip Phase 7 to ✅, Phase 8 to 🔜; refresh test count + stage line;
+  note `mmco run sensors.yaml` records a configured session with a live status table.
+- [ ] **Step 3 — Commit.** `Docs: mark Phase 7 complete in progress README`.
+
+**Files (Phase 7 total):** `src/mmco/config/{__init__,config,profiles}.py`,
+`src/mmco/cli/{__init__,main,status_view}.py`; extension to `supervisor/supervisor.py`;
+`tests/config/test_*.py`, `tests/cli/test_*.py`.
+
+**Outcome:** `mmco run sensors.yaml` records a configured session and finalizes all three artifacts,
+printing a live status table; the status renderer reflects live per-sensor counters. (Detached
+`mmco stop` / `mmco status` against a running daemon await the IPC channel — see decisions above.)
 
 ---
 

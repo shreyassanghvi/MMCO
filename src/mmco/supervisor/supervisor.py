@@ -216,6 +216,19 @@ class Supervisor:
         """Return sensor ids whose child process is still running."""
         return [sid for sid, rt in self._runtimes.items() if rt.process.is_alive()]
 
+    def snapshot(self) -> list[dict]:
+        """Return per-sensor live counters for the status view (one row per sensor)."""
+        return [
+            {
+                "sensor_id": sid,
+                "alive": rt.process.is_alive(),
+                "dropped": rt.consumer.dropped,
+                "reconnects": self.respawns.get(sid, 0),
+                "last_code": rt.last_log_code,
+            }
+            for sid, rt in self._runtimes.items()
+        ]
+
     def stop(self) -> Path:
         """Stop all hosts, drain the tail, write the manifest, and unlink every segment."""
         for rt in self._runtimes.values():
