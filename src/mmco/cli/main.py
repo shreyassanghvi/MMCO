@@ -3,7 +3,8 @@
 ``mmco run [sensors.yaml] [--seconds N]`` boots a :class:`~mmco.supervisor.supervisor.Supervisor`,
 ticks the session, and finalizes the manifest + log + summary on completion, on Ctrl-C, or on a
 control ``stop``. With ``--seconds`` it runs for a bounded time (handy for the demo and tests); with
-none it runs **unbounded** until a stop signal (SIGTERM/SIGINT) or ``mmco stop`` (the container mode).
+none it runs **unbounded** until a stop signal (SIGTERM/SIGINT) or ``mmco stop`` — the container
+mode.
 With **no config path** it auto-discovers devices and builds a default session, falling back to the
 simulated sensor when nothing runnable is found (spec §7).
 
