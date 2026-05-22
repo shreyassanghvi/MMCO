@@ -16,14 +16,15 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 5 complete (resilience demo green); Phase 6 next.
-**Active branch:** `impl/phase-5-supervisor` (off `master`).
+**Current stage:** Phase 6 complete (self-documenting sessions green); Phase 7 next.
+**Active branch:** `impl/phase-6-session-log` (off `master`).
 **Last updated:** 2026-05-22.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 86 passing
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 92 passing
 (2 skipped: POSIX-only shared-memory sweep tests, skipped on Windows). A simulated session writes
-parquet + `manifest.json` end-to-end; kill or unplug a sensor mid-session and the others keep
-recording while it auto-reconnects into a new segment.
+`manifest.json` + `session.log.jsonl` + `summary.md` end-to-end; kill or unplug a sensor mid-session
+and the others keep recording while it auto-reconnects — the summary names the fault in plain English
+with its error code.
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -41,8 +42,8 @@ recording while it auto-reconnects into a new segment.
 | 3  | Simulated driver + driver host | ✅ Done — sim driver, control/log channels, cross-process host |
 | 4  | Recorder + writers + manifest | ✅ Done — writer registry, parquet writer, manifest author, recorder + e2e |
 | 5  | Supervisor: health & graceful degradation | ✅ Done — watchdog, gap logging, backoff restart, identity resume |
-| 6  | Session log + auto-summary | 🔜 Next |
-| 7  | Control surface: config, CLI, live status | ⬜ Not started |
+| 6  | Session log + auto-summary | ✅ Done — session.log.jsonl + readable summary.md, auto-generated |
+| 7  | Control surface: config, CLI, live status | 🔜 Next |
 | 8  | Device discovery + default session + out-of-box | ⬜ Not started |
 | 9  | USB webcam (V4L2) driver + video writer | ⬜ Not started |
 | 10 | Containerization & one-command launch | ⬜ Not started |
