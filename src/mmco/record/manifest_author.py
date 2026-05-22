@@ -12,7 +12,7 @@ from pathlib import Path
 
 from mmco.core.capabilities import Capabilities, StreamType
 from mmco.core.clock import ClockAnchor
-from mmco.core.manifest import Segment, SessionManifest, StreamBlock
+from mmco.core.manifest import Gap, Segment, SessionManifest, StreamBlock
 
 
 @dataclass
@@ -22,6 +22,7 @@ class _StreamState:
     latency_offset: int
     dropped: int = 0
     segments: list[Segment] = field(default_factory=list)
+    gaps: list[Gap] = field(default_factory=list)
 
 
 class ManifestAuthor:
@@ -49,6 +50,10 @@ class ManifestAuthor:
         """Append a written file's segment to a stream."""
         self._streams[sensor_id].segments.append(segment)
 
+    def add_gap(self, sensor_id: str, gap: Gap) -> None:
+        """Append a coverage gap (a fault/reconnect hole) to a stream."""
+        self._streams[sensor_id].gaps.append(gap)
+
     def set_dropped(self, sensor_id: str, dropped: int) -> None:
         """Set a stream's dropped-event count."""
         self._streams[sensor_id].dropped = dropped
@@ -63,7 +68,7 @@ class ManifestAuthor:
                 latency_offset=state.latency_offset,
                 dropped=state.dropped,
                 segments=tuple(state.segments),
-                gaps=(),
+                gaps=tuple(state.gaps),
             )
             for sensor_id, state in self._streams.items()
         )

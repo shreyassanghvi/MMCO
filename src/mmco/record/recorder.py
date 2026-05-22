@@ -13,7 +13,8 @@ from pathlib import Path
 from mmco.bus.bus import BusConsumer
 from mmco.core.capabilities import Capabilities, StreamType
 from mmco.core.clock import ClockAnchor, OffsetRegistry
-from mmco.core.manifest import Segment
+from mmco.core.errors import ErrorCode
+from mmco.core.manifest import Gap, Segment
 from mmco.paths import manifest_path, session_dir
 from mmco.record import parquet_writer  # noqa: F401  (registers the tabular writer)
 from mmco.record.manifest_author import ManifestAuthor
@@ -46,6 +47,9 @@ class Recorder:
         )
         self._writers: dict[str, StreamWriter] = {}
         self._rel_paths: dict[str, str] = {}
+        self._block_index: dict[str, int] = {}
+        self._registered: set[str] = set()
+        self._seen: set[str] = set()
 
     def start(self) -> None:
         """Create the session directory."""
@@ -56,17 +60,39 @@ class Recorder:
         if writer is not None:
             return writer
         caps = self._capabilities[sensor_id]
-        rel = f"{sensor_id}-000.{_SUFFIX[caps.type]}"
+        index = self._block_index.get(sensor_id, 0)
+        rel = f"{sensor_id}-{index:03d}.{_SUFFIX[caps.type]}"
         writer = writer_for(
             caps.type, capabilities=caps, file_path=str(self._session_dir / rel)
         )
         writer.open()
-        self._author.add_stream(
-            sensor_id, caps.type, caps, latency_offset=self._offsets.get(sensor_id)
-        )
+        if sensor_id not in self._registered:
+            self._author.add_stream(
+                sensor_id, caps.type, caps, latency_offset=self._offsets.get(sensor_id)
+            )
+            self._registered.add(sensor_id)
         self._writers[sensor_id] = writer
         self._rel_paths[sensor_id] = rel
+        self._block_index[sensor_id] = index
+        self._seen.add(sensor_id)
         return writer
+
+    def _finalize_writer(self, sensor_id: str) -> None:
+        """Close the current writer for a sensor and record its segment (if it has data)."""
+        writer = self._writers.pop(sensor_id, None)
+        if writer is None:
+            return
+        writer.close()
+        if writer.start_timestamp is not None:
+            self._author.add_segment(
+                sensor_id,
+                Segment(
+                    file_path=self._rel_paths[sensor_id],
+                    start_timestamp=writer.start_timestamp,
+                    end_timestamp=writer.end_timestamp,
+                    block_index=self._block_index[sensor_id],
+                ),
+            )
 
     def record_available(self, timeout: float = 0.0) -> bool:
         """Poll once; route and write one event if present. Return whether one was recorded."""
@@ -78,26 +104,25 @@ class Recorder:
         self._writer_for(meta.sensor_id).write_event(t_event, payload)
         return True
 
+    def open_gap(
+        self, sensor_id: str, *, start: int, end: int, reason: str, code: ErrorCode
+    ) -> None:
+        """Close the sensor's current segment, record a coded gap, and resume into a new segment."""
+        self._finalize_writer(sensor_id)
+        self._author.add_gap(
+            sensor_id, Gap(start=start, end=end, reason=reason, code=code)
+        )
+        self._block_index[sensor_id] = self._block_index.get(sensor_id, 0) + 1
+
     def stop(self) -> Path:
         """Close writers, finalize segments + drops, and write ``manifest.json``."""
-        sensor_ids = list(self._writers)
-        for sensor_id in sensor_ids:
-            writer = self._writers[sensor_id]
-            writer.close()
-            if writer.start_timestamp is not None:
-                self._author.add_segment(
-                    sensor_id,
-                    Segment(
-                        file_path=self._rel_paths[sensor_id],
-                        start_timestamp=writer.start_timestamp,
-                        end_timestamp=writer.end_timestamp,
-                        block_index=0,
-                    ),
-                )
-            # Single-stream sessions can attribute the consumer's drops to that stream;
-            # per-sensor drop attribution for multi-stream sessions arrives in Phase 5.
-            if len(sensor_ids) == 1:
-                self._author.set_dropped(sensor_id, self._consumer.dropped)
+        for sensor_id in list(self._writers):
+            self._finalize_writer(sensor_id)
+        # Single-stream sessions can attribute the consumer's drops to that stream;
+        # per-sensor drop attribution for multi-stream sessions arrives later.
+        if len(self._seen) == 1:
+            only = next(iter(self._seen))
+            self._author.set_dropped(only, self._consumer.dropped)
         path = manifest_path(self._session_dir)
         self._author.write(str(path))
         return path
