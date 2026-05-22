@@ -1455,24 +1455,111 @@ path is documented in the checklist; everything else is hardware-free and always
 
 **Goal:** Ship MMCO as a containerized service with a single launch command.
 
-**Tasks**
-- **10.1 Dockerfile** — Linux base with ffmpeg + Python deps; install `mmco`; non-root user. *Tested by:*
-  image builds; `mmco --help` runs in-container.
-- **10.2 docker-compose** — service def with a mounted host **volume** at `recordings/` (output survives
-  the container) and **device passthrough** (`devices: ["/dev/video0:/dev/video0", ...]` + relevant
-  `group_add`/udev for V4L2/ALSA/serial; documented privileged/`--device-cgroup-rule` fallback for
-  dynamic device sets). `mmco status` attaches over the control socket when detached. *Tested by:*
-  `docker compose up` runs a sim-only session and writes a recording to the host volume; `status`
-  reachable on the detached container.
-- **10.3 Entrypoint + default config** — container defaults to auto-discovery/sim fallback so
-  `docker compose up` records with no extra steps even with **no devices mapped**. *Tested by:*
-  container with no devices → sim fallback recording (manifest + log + summary) appears on the host.
-- **10.4 README quickstart** — one-command instructions, hardware notes, output layout. *(Docs.)*
+**Branch:** `impl/phase-10-containerization` (off `master`, after Phase 9 merge).
 
-**Files:** `Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh`, `README.md`;
-`tests/integration/test_container_smoke.py` (optional, env-gated).
+**Design decisions (locked for this phase):**
+- **Only one piece is genuinely test-first Python: a container-friendly `run`.** The
+  Dockerfile/compose/entrypoint are infra artifacts, not unit-testable in a RED->GREEN cycle; they are
+  validated by an **env-gated Docker smoke test** (skips when Docker is absent, the same pattern as the
+  POSIX-only shm skips). At implementation time I will run a real `docker build` / `docker compose up`
+  **if Docker is available on the box**; if not (the Windows dev box may lack it), the smoke test skips
+  and the container path is **flagged for Linux/CI validation** (joining the existing follow-ups).
+- **Detached `mmco status` stays deferred (consistent with Phase 7).** There is still no control
+  socket/IPC, so the container does **not** expose a detached `status` command — that would require the
+  daemon deferred in Phase 7. The honest substitute: `mmco run` already prints the live per-sensor
+  status table to stdout, so `docker compose logs -f` shows live status on a detached container. The
+  compose file and README say exactly this; nothing claims a working `status` socket. **Flagged** as
+  the same deviation carried since Phase 7.
+- **Container records until stopped.** `docker compose up` must record until `docker compose down`
+  (SIGTERM), not for a fixed 10 s. So `run` gains an **unbounded** mode (no `--seconds` -> run until a
+  stop signal) with graceful finalize on **SIGTERM/SIGINT**. The signal handler just sets a stop flag
+  the tick loop checks; it is unit-tested by invoking the handler directly (cross-platform,
+  deterministic), and the real signal delivery is covered by the container smoke test on Linux.
+- **Env-var config for zero-arg containers.** `mmco run` reads its output directory from
+  `MMCO_OUTPUT_DIR` when `--output-dir` is not given, so the compose file configures the box purely
+  through `environment:` + a mounted volume, with the entrypoint a bare `mmco run`.
+- **Base image + deps.** `python:3.14-slim`; apt-install `ffmpeg` + `v4l-utils` (the `av` wheel bundles
+  ffmpeg for encoding, but V4L2 device access and tooling want the system packages); `pip install .`;
+  run as a **non-root** user. The exact base tag is confirmed at build (3.14 is GA in this timeline).
+- **Build order:** 10.1 container-friendly `run` -> 10.2 Dockerfile -> 10.3 compose + entrypoint ->
+  10.4 README quickstart + gate.
+- Commands via the venv interpreter; ruff exit code checked directly.
 
-**Outcome:** `docker compose up` → a recording on the host. The containerized-service story is shipped.
+### Task 10.1 — Container-friendly `run`: unbounded + signals + env output dir
+
+**Files:** modify `src/mmco/cli/main.py`; extend `tests/cli/test_run.py`. (Spec §7.)
+
+`run_session` accepts `max_seconds: float | None` (None = run until a stop signal). `mmco run` makes
+`--seconds` optional (no default -> unbounded) and reads `--output-dir` from `MMCO_OUTPUT_DIR` when
+unset. A small stop-signal helper installs SIGTERM/SIGINT handlers that set a stop flag the tick loop
+checks, finalizing the session gracefully.
+
+- [ ] **Step 1 — Failing tests.** `--output-dir` falls back to `MMCO_OUTPUT_DIR` (monkeypatched env)
+  when the flag is absent, and the flag still wins when given; invoking the stop-signal handler sets the
+  flag so an (otherwise unbounded) run would finalize; the existing bounded `--seconds 1` path still
+  finalizes all artifacts.
+- [ ] **Step 2 — RED.** `python -m pytest tests/cli/test_run.py -v` → FAIL on the new cases.
+- [ ] **Step 3 — Implement.** Make `max_seconds` optional with a stop-flag loop; add the SIGTERM/SIGINT
+  helper; read `MMCO_OUTPUT_DIR`; keep the bounded path intact.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `CLI: unbounded run with signal-driven finalize and MMCO_OUTPUT_DIR`.
+
+### Task 10.2 — Dockerfile
+
+**Files:** create `Dockerfile`, `.dockerignore`. (Spec §7.)
+
+A `python:3.14-slim` image: apt-install `ffmpeg` + `v4l-utils`, copy the project, `pip install .`,
+create and switch to a non-root user, default `CMD` to `mmco run`. `.dockerignore` excludes
+`recordings/`, `.venv/`, `.git/`, caches.
+
+- [ ] **Step 1 — Build (if Docker present).** `docker build -t mmco:dev .`; then
+  `docker run --rm mmco:dev mmco --help` prints usage. If Docker is absent on the box, record that the
+  build is **deferred to Linux/CI** and proceed (the artifacts are still authored).
+- [ ] **Step 2 — Commit.** `Container: add Dockerfile (slim base, ffmpeg, non-root, mmco entrypoint)`.
+
+### Task 10.3 — docker-compose + entrypoint + env-gated smoke test
+
+**Files:** create `docker-compose.yml`, `docker/entrypoint.sh`;
+`tests/integration/test_container_smoke.py`. (Spec §7.)
+
+A compose service that: mounts a host volume at the recordings directory (output survives the
+container); sets `MMCO_OUTPUT_DIR`; runs the entrypoint (a bare `mmco run` -> auto-discovery/sim
+fallback); and **documents** device passthrough (commented `devices:` examples for
+`/dev/video0`/ALSA/serial, the `group_add`/udev notes, and the privileged/`--device-cgroup-rule`
+fallback for dynamic device sets). The smoke test is **env-gated**: it skips unless Docker is available.
+
+- [ ] **Step 1 — Failing/var test.** `tests/integration/test_container_smoke.py` skips when `docker`
+  is not on `PATH`; when present, it runs `docker compose up` with **no devices mapped**, waits for the
+  run to finalize, and asserts a sim-fallback recording (`manifest.json` + `session.log.jsonl` +
+  `summary.md`) appears on the **host volume**. On the Windows dev box (no Docker) it skips.
+- [ ] **Step 2 — RED/skip.** `python -m pytest tests/integration/test_container_smoke.py -v` → skip
+  (no Docker) or FAIL (Docker present, compose/entrypoint not yet written).
+- [ ] **Step 3 — Implement.** Add `docker-compose.yml`, `docker/entrypoint.sh` (exec `mmco run`); make
+  the smoke test pass where Docker is present.
+- [ ] **Step 4 — GREEN/skip.** pass or skip.
+- [ ] **Step 5 — Commit.** `Container: compose with volume + device-passthrough docs and a smoke test`.
+
+### Task 10.4 — README quickstart + Phase 10 gate
+
+**Files:** update `README.md`. (Spec §7.)
+
+- [ ] **Step 1 — README quickstart.** One-command launch (`docker compose up` -> a recording on the
+  host volume), the `docker compose logs -f` live-status note (detached `status` deferred), device
+  passthrough + hardware notes (link the checklist), and the `recordings/<session_id>/` output layout.
+- [ ] **Step 2 — Full suite + lint.** `python -m pytest` → all green (Linux-only + Docker-gated checks
+  skip on Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 3 — Update README status.** Flip Phase 10 to ✅; refresh test/skip count + stage line;
+  record any Docker-on-Linux validation follow-up.
+- [ ] **Step 4 — Commit.** `Docs: container quickstart and mark Phase 10 complete`.
+
+**Files (Phase 10 total):** `Dockerfile`, `.dockerignore`, `docker-compose.yml`,
+`docker/entrypoint.sh`; extension to `src/mmco/cli/main.py`, `README.md`; extension to
+`tests/cli/test_run.py`, `tests/integration/test_container_smoke.py`.
+
+**Outcome:** `docker compose up` -> a recording on the host (auto-discovery, sim fallback with no
+devices), surviving the container via the mounted volume; `docker compose logs -f` shows the live
+status table. The containerized-service story is shipped. Detached `mmco status` and a real
+`docker build`/`up` on Linux remain the only validation follow-ups.
 
 ---
 
