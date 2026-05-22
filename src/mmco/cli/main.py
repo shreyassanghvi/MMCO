@@ -21,11 +21,13 @@ from __future__ import annotations
 import argparse
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 from mmco.cli.status_view import render_status
 from mmco.config.config import ConfigError, SensorConfig, SessionConfig, load_config
+from mmco.config.profiles import resolve_profile
 from mmco.core.capabilities import Capabilities, Column, StreamType, TabularSchema
 from mmco.discovery.default_session import build_default_session
 from mmco.discovery.discovery import discover_devices
@@ -67,12 +69,13 @@ _DRIVER_REGISTRY: dict[str, Callable[[SensorConfig], SensorSpec]] = {
 }
 
 
-def build_spec(sc: SensorConfig) -> SensorSpec:
-    """Resolve a sensor config to a :class:`SensorSpec` via the driver registry."""
+def build_spec(sc: SensorConfig, *, recording_profiles: dict | None = None) -> SensorSpec:
+    """Resolve a sensor config to a :class:`SensorSpec`, attaching its offset + resolved profile."""
     builder = _DRIVER_REGISTRY.get(sc.driver)
     if builder is None:
         raise ConfigError(f"unknown driver {sc.driver!r} for sensor {sc.id!r}")
-    return builder(sc)
+    profile = resolve_profile(recording_profiles or {}, sc.protocol, sc.profile_override)
+    return replace(builder(sc), latency_offset_ns=sc.latency_offset_ns, profile=profile)
 
 
 def runnable_driver_names() -> set[str]:
@@ -93,7 +96,9 @@ def run_session(
     """
     session_id = session_id or _new_session_id()
     base_dir = Path(config.output_dir)
-    specs = [build_spec(sc) for sc in config.sensors]
+    specs = [
+        build_spec(sc, recording_profiles=config.recording_profiles) for sc in config.sensors
+    ]
     supervisor = Supervisor(
         session_id=session_id,
         base_dir=base_dir,
