@@ -16,13 +16,14 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 4 complete (first end-to-end recording green); Phase 5 next.
-**Active branch:** `impl/phase-4-recorder` (off `master`).
-**Last updated:** 2026-05-21.
+**Current stage:** Phase 5 complete (resilience demo green); Phase 6 next.
+**Active branch:** `impl/phase-5-supervisor` (off `master`).
+**Last updated:** 2026-05-22.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 70 passing
-(1 skipped: a POSIX-only shared-memory sweep test, skipped on Windows). A simulated session writes
-parquet + `manifest.json` end-to-end with no hardware.
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 86 passing
+(2 skipped: POSIX-only shared-memory sweep tests, skipped on Windows). A simulated session writes
+parquet + `manifest.json` end-to-end; kill or unplug a sensor mid-session and the others keep
+recording while it auto-reconnects into a new segment.
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -39,8 +40,8 @@ parquet + `manifest.json` end-to-end with no hardware.
 | 2  | Event bus transport | ✅ Done — shared-memory ring, metadata queue, gen-checked producer/consumer |
 | 3  | Simulated driver + driver host | ✅ Done — sim driver, control/log channels, cross-process host |
 | 4  | Recorder + writers + manifest | ✅ Done — writer registry, parquet writer, manifest author, recorder + e2e |
-| 5  | Supervisor: health & graceful degradation | 🔜 Next |
-| 6  | Session log + auto-summary | ⬜ Not started |
+| 5  | Supervisor: health & graceful degradation | ✅ Done — watchdog, gap logging, backoff restart, identity resume |
+| 6  | Session log + auto-summary | 🔜 Next |
 | 7  | Control surface: config, CLI, live status | ⬜ Not started |
 | 8  | Device discovery + default session + out-of-box | ⬜ Not started |
 | 9  | USB webcam (V4L2) driver + video writer | ⬜ Not started |

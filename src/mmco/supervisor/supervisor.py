@@ -19,6 +19,7 @@ from mmco.bus.metaqueue import MetaQueue
 from mmco.bus.ring import RingBuffer, sweep_stale_segments
 from mmco.core.capabilities import Capabilities
 from mmco.core.clock import MonotonicClock, OffsetRegistry
+from mmco.core.errors import ErrorCode
 from mmco.core.logevent import LogEvent, LogLevel
 from mmco.host.control import Control, LogChannel
 from mmco.host.driver_host import HostSpec, spawn_driver_host
@@ -58,6 +59,7 @@ class _Runtime:
     attempts: int = 0
     next_respawn_at: float | None = None
     last_t_acquire_ns: int = field(default=0)
+    last_log_code: ErrorCode | None = None
 
 
 class Supervisor:
@@ -141,7 +143,10 @@ class Supervisor:
         now_ns = self._clock.now_ns()
         for sensor_id, rt in self._runtimes.items():
             self._drain(rt, now)
-            self.aggregated_logs.extend(rt.log_channel.drain(timeout=0.0))
+            for event in rt.log_channel.drain(timeout=0.0):
+                self.aggregated_logs.append(event)
+                if event.code is not None:
+                    rt.last_log_code = event.code  # the host's own fault classification
             if rt.alive:
                 self._check_health(sensor_id, rt, now, now_ns)
             elif rt.next_respawn_at is not None and now >= rt.next_respawn_at:
@@ -162,16 +167,24 @@ class Supervisor:
         if code is None:
             return
         rt.process.join(timeout=1.0)  # reap the dead child
+        # An exited host reports its own cause (e.g. device-gone E004); prefer it over the
+        # watchdog's generic "process exited" E002 so the manifest gap names what really happened.
+        gap_code = code
+        if not rt.process.is_alive() and rt.last_log_code in (
+            ErrorCode.DRIVER_CRASH,
+            ErrorCode.DEVICE_DISCONNECTED,
+        ):
+            gap_code = rt.last_log_code
         self._recorder.open_gap(
             sensor_id,
             start=rt.last_t_acquire_ns or now_ns,
             end=now_ns,
-            reason=code.message,
-            code=code,
+            reason=gap_code.message,
+            code=gap_code,
         )
         self.aggregated_logs.append(
-            LogEvent(t_ns=now_ns, level=LogLevel.ERROR, message=code.message,
-                     code=code, sensor_id=sensor_id)
+            LogEvent(t_ns=now_ns, level=LogLevel.ERROR, message=gap_code.message,
+                     code=gap_code, sensor_id=sensor_id)
         )
         rt.alive = False
         rt.next_respawn_at = now + self._policy.backoff(rt.attempts)
@@ -184,6 +197,7 @@ class Supervisor:
         )
         rt.alive = True
         rt.next_respawn_at = None
+        rt.last_log_code = None  # classify the next fault fresh
         self._watchdog.note_event(sensor_id, now)  # grace so it is not instantly re-flagged
         self.respawns[sensor_id] = self.respawns.get(sensor_id, 0) + 1
         self.aggregated_logs.append(
