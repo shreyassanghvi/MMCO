@@ -28,10 +28,17 @@ from pathlib import Path
 from mmco.cli.status_view import render_status
 from mmco.config.config import ConfigError, SensorConfig, SessionConfig, load_config
 from mmco.config.profiles import resolve_profile
-from mmco.core.capabilities import Capabilities, Column, StreamType, TabularSchema
+from mmco.core.capabilities import (
+    Capabilities,
+    Column,
+    StreamType,
+    TabularSchema,
+    VideoSchema,
+)
 from mmco.discovery.default_session import build_default_session
 from mmco.discovery.discovery import discover_devices
 from mmco.drivers.simulated import SimConfig, SimulatedDriver
+from mmco.drivers.webcam_v4l2 import WebcamConfig, WebcamDriver
 from mmco.paths import session_dir
 from mmco.supervisor.policy import RestartPolicy
 from mmco.supervisor.supervisor import SensorSpec, Supervisor
@@ -42,6 +49,9 @@ _STATUS_EVERY_S = 1.0
 _N_SLOTS = 16
 _SLOT_SIZE = 64
 _DEFAULT_OUTPUT_DIR = "."
+# Default webcam geometry when discovery doesn't specify one (real cameras override on open).
+_CAM_WIDTH, _CAM_HEIGHT = 640, 480
+_CAM_VIDEO_SLOTS = 8
 
 
 def _build_simulated(sc: SensorConfig) -> SensorSpec:
@@ -63,9 +73,41 @@ def _build_simulated(sc: SensorConfig) -> SensorSpec:
     )
 
 
-# The seam Phase 8 generalizes into an entry-point plugin registry.
+def _build_webcam(sc: SensorConfig) -> SensorSpec:
+    """Map a webcam sensor config to a runnable :class:`SensorSpec` (real V4L2 backend)."""
+    capabilities = Capabilities(
+        type=StreamType.VIDEO,
+        rate=sc.rate_hz,
+        schema=VideoSchema(
+            codec_or_raw="raw",
+            width=_CAM_WIDTH,
+            height=_CAM_HEIGHT,
+            pixel_format="rgb24",
+        ),
+    )
+    return SensorSpec(
+        sensor_id=sc.id,
+        identity=sc.identity or sc.id,
+        rate_hz=sc.rate_hz,
+        n_slots=_CAM_VIDEO_SLOTS,
+        slot_size=_CAM_WIDTH * _CAM_HEIGHT * 3,
+        driver_factory=WebcamDriver,
+        driver_config=WebcamConfig(
+            sensor_id=sc.id,
+            identity=sc.identity or sc.id,
+            width=_CAM_WIDTH,
+            height=_CAM_HEIGHT,
+            fps=sc.rate_hz,
+            backend="v4l2",
+        ),
+        capabilities=capabilities,
+    )
+
+
+# The seam (a future entry-point plugin registry) mapping driver names to spec builders.
 _DRIVER_REGISTRY: dict[str, Callable[[SensorConfig], SensorSpec]] = {
     "simulated": _build_simulated,
+    "webcam_v4l2": _build_webcam,
 }
 
 
