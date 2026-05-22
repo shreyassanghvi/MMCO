@@ -21,6 +21,14 @@ from mmco.core.capabilities import Capabilities
 from mmco.core.events import DriverSample
 
 
+class DeviceDisconnectedError(Exception):
+    """Raised by a driver's ``read()`` when its device has vanished (maps to ``E004``).
+
+    Distinct from a generic read error so the host can classify a clean disconnect (a cable pull)
+    apart from an unexpected driver crash.
+    """
+
+
 class DriverHealth(Enum):
     """Coarse driver liveness reported by ``SensorDriver.health()``."""
 

@@ -92,3 +92,27 @@ def test_driver_crash_surfaces_error_coded_log_and_child_exits():
         log_channel.close()
         ring.close()
         ring.unlink()
+
+
+def test_device_disconnect_surfaces_e004_log_and_child_exits():
+    ring = RingBuffer.create(n_slots=_N_SLOTS, slot_size=_SLOT_SIZE)
+    metaqueue = MetaQueue()
+    control = Control()
+    log_channel = LogChannel()
+    proc = spawn_driver_host(
+        _make_spec(ring, failure="disconnect"), metaqueue, control, log_channel
+    )
+    consumer = BusConsumer(ring, metaqueue)
+    try:
+        _collect(consumer, 3)  # the pre-disconnect events
+        proc.join(timeout=5.0)
+        assert not proc.is_alive()
+        logs = log_channel.drain(timeout=1.0)
+        assert any(e.code is ErrorCode.DEVICE_DISCONNECTED for e in logs)
+    finally:
+        control.request_stop()
+        proc.join(timeout=5.0)
+        metaqueue.close()
+        log_channel.close()
+        ring.close()
+        ring.unlink()

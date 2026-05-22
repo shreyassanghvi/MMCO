@@ -23,7 +23,7 @@ from mmco.bus.bus import BusProducer
 from mmco.bus.metaqueue import MetaQueue
 from mmco.bus.ring import RingBuffer
 from mmco.core.clock import MonotonicClock
-from mmco.core.driver import SensorDriver
+from mmco.core.driver import DeviceDisconnectedError, SensorDriver
 from mmco.core.errors import ErrorCode
 from mmco.core.logevent import LogEvent, LogLevel
 from mmco.host.control import Control, LogChannel
@@ -68,7 +68,18 @@ def run_driver_host(
         while not control.stop_requested():
             try:
                 sample = driver.read()
-            except Exception as exc:  # driver crash — surface a coded log event and stop
+            except DeviceDisconnectedError as exc:  # clean device-gone -> E004
+                log_channel.emit(
+                    LogEvent(
+                        t_ns=clock.now_ns(),
+                        level=LogLevel.ERROR,
+                        message=f"device disconnected: {exc}",
+                        code=ErrorCode.DEVICE_DISCONNECTED,
+                        sensor_id=spec.sensor_id,
+                    )
+                )
+                break
+            except Exception as exc:  # unexpected driver crash -> E002
                 log_channel.emit(
                     LogEvent(
                         t_ns=clock.now_ns(),
