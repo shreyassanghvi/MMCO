@@ -19,6 +19,7 @@ RECORDINGS_DIRNAME = "recordings"
 MANIFEST_FILENAME = "manifest.json"
 SESSION_LOG_FILENAME = "session.log.jsonl"
 SUMMARY_FILENAME = "summary.md"
+CONTROL_ADDR_FILENAME = "control.addr"
 
 
 def recordings_root(base: Path) -> Path:
@@ -44,3 +45,8 @@ def session_log_path(session_dir: Path) -> Path:
 def summary_path(session_dir: Path) -> Path:
     """Return the summary path inside ``session_dir``."""
     return session_dir / SUMMARY_FILENAME
+
+
+def control_addr_path(session_dir: Path) -> Path:
+    """Return the control-channel address file inside ``session_dir`` (present while running)."""
+    return session_dir / CONTROL_ADDR_FILENAME

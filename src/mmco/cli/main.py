@@ -40,7 +40,9 @@ from mmco.discovery.default_session import build_default_session
 from mmco.discovery.discovery import discover_devices
 from mmco.drivers.simulated import SimConfig, SimulatedDriver
 from mmco.drivers.webcam_v4l2 import WebcamConfig, WebcamDriver
-from mmco.paths import session_dir
+from mmco.ipc.client import control_request, find_session_addr
+from mmco.ipc.server import ControlServer
+from mmco.paths import control_addr_path, session_dir
 from mmco.supervisor.policy import RestartPolicy
 from mmco.supervisor.supervisor import SensorSpec, Supervisor
 
@@ -174,7 +176,14 @@ def run_session(
         specs=specs,
         policy=RestartPolicy(base_s=0.5, cap_s=5.0),
     )
-    supervisor.start()
+    supervisor.start()  # creates the session dir the control server publishes into
+    sdir = session_dir(base_dir, session_id)
+    control = ControlServer(
+        snapshot=supervisor.snapshot,
+        request_stop=stop_flag.set,
+        addr_path=str(control_addr_path(sdir)),
+    )
+    control.start()
     next_status = time.monotonic()
     deadline = None if max_seconds is None else time.monotonic() + max_seconds
     try:
@@ -188,8 +197,9 @@ def run_session(
     except KeyboardInterrupt:
         print("\nstopping (Ctrl-C) — finalizing session...")
     finally:
+        control.close()
         supervisor.stop()
-    return session_dir(base_dir, session_id)
+    return sdir
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -209,21 +219,55 @@ def main(argv: list[str] | None = None) -> int:
         "--output-dir", default=None,
         help=f"where to write recordings (default: ${_OUTPUT_DIR_ENV} or the cwd)",
     )
+    for name, helptext in (
+        ("status", "print the live status table of a running session"),
+        ("stop", "ask a running session to finalize and stop"),
+    ):
+        ctl = sub.add_parser(name, help=helptext)
+        ctl.add_argument(
+            "--output-dir", default=None,
+            help=f"recordings location to search (default: ${_OUTPUT_DIR_ENV} or the cwd)",
+        )
+        ctl.add_argument("--session-dir", default=None, help="target a specific session directory")
 
     args = parser.parse_args(argv)
     if args.command == "run":
-        output_dir = _resolve_output_dir(args.output_dir)
-        try:
-            config = _resolve_config(args.config, output_dir=output_dir)
-        except ConfigError as exc:
-            print(f"{exc.code.code} {exc}")
-            return 1
-        stop_flag = threading.Event()
-        _install_signal_handlers(stop_flag)
-        sdir = run_session(config, max_seconds=args.seconds, stop_flag=stop_flag)
-        print(f"session written to {sdir}")
-        return 0
+        return _cmd_run(args)
+    if args.command in ("status", "stop"):
+        return _cmd_control(args)
     return 2
+
+
+def _cmd_run(args) -> int:
+    output_dir = _resolve_output_dir(args.output_dir)
+    try:
+        config = _resolve_config(args.config, output_dir=output_dir)
+    except ConfigError as exc:
+        print(f"{exc.code.code} {exc}")
+        return 1
+    stop_flag = threading.Event()
+    _install_signal_handlers(stop_flag)
+    sdir = run_session(config, max_seconds=args.seconds, stop_flag=stop_flag)
+    print(f"session written to {sdir}")
+    return 0
+
+
+def _cmd_control(args) -> int:
+    output_dir = _resolve_output_dir(args.output_dir)
+    try:
+        addr = find_session_addr(output_dir, session_dir=args.session_dir)
+    except FileNotFoundError as exc:
+        print(f"no running session: {exc}")
+        return 1
+    response = control_request(str(addr), args.command)
+    if not response.get("ok"):
+        print(f"error: {response.get('error', response)}")
+        return 1
+    if args.command == "status":
+        print(response.get("body", ""))
+    else:
+        print("stop requested — session is finalizing")
+    return 0
 
 
 def _resolve_config(config_path: str | None, *, output_dir: str) -> SessionConfig:
