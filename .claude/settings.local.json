@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./.venv/Scripts/python.exe -m ruff check src/mmco/cli/main.py tests/cli/test_run.py)",
+      "Bash(echo \"ruff_exit=$?\")",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  }
+}

@@ -1,24 +1,24 @@
 """The ``mmco`` command-line entry point (design spec §7).
 
 ``mmco run [sensors.yaml] [--seconds N]`` boots a :class:`~mmco.supervisor.supervisor.Supervisor`,
-ticks the session, and finalizes the manifest + log + summary on completion or on Ctrl-C. The
-bounded ``--seconds`` makes the command testable and gives the demo a definite end. With **no config
-path** it auto-discovers devices and builds a default session, falling back to the simulated sensor
-when nothing runnable is found (spec §7).
+ticks the session, and finalizes the manifest + log + summary on completion, on Ctrl-C, or on a
+control ``stop``. With ``--seconds`` it runs for a bounded time (handy for the demo and tests); with
+none it runs **unbounded** until a stop signal (SIGTERM/SIGINT) or ``mmco stop`` (the container mode).
+With **no config path** it auto-discovers devices and builds a default session, falling back to the
+simulated sensor when nothing runnable is found (spec §7).
 
-A small **simulated-only** driver registry maps a config's ``driver`` name to a builder that
-produces a :class:`SensorSpec`. Real drivers ship via an entry-point plugin registry (Phase 9+);
-this dict is the seam, and its keys are the ``runnable_drivers`` the default-session builder filters
-to. A live status table is printed each tick (best-effort, added in Task 7.4).
-
-Detached ``mmco stop`` / ``mmco status`` against a separately-running daemon need an IPC channel
-(socket/pidfile) that is out of scope this phase; only the in-process ``run`` and the status
-*renderer* land here (see the Phase 7 plan's locked decisions).
+A small driver registry maps a config's ``driver`` name to a builder that produces a
+:class:`SensorSpec`; its keys are the ``runnable_drivers`` the default-session builder filters to. A
+live status table is printed each tick. The output directory defaults from ``MMCO_OUTPUT_DIR`` when
+``--output-dir`` is not given, so a container configures the box purely through the environment.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import signal
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -43,9 +43,9 @@ from mmco.paths import session_dir
 from mmco.supervisor.policy import RestartPolicy
 from mmco.supervisor.supervisor import SensorSpec, Supervisor
 
-_DEFAULT_SECONDS = 10.0
 _TICK_S = 0.05
 _STATUS_EVERY_S = 1.0
+_OUTPUT_DIR_ENV = "MMCO_OUTPUT_DIR"
 _N_SLOTS = 16
 _SLOT_SIZE = 64
 _DEFAULT_OUTPUT_DIR = "."
@@ -129,15 +129,41 @@ def _new_session_id() -> str:
     return datetime.now(UTC).strftime("sess-%Y%m%dT%H%M%SZ")
 
 
-def run_session(
-    config: SessionConfig, *, max_seconds: float, session_id: str | None = None
-) -> Path:
-    """Record a configured session for up to ``max_seconds``; finalize and return its directory.
+def _resolve_output_dir(flag: str | None) -> str:
+    """Output dir: an explicit ``--output-dir`` wins, else ``MMCO_OUTPUT_DIR``, else the cwd."""
+    if flag is not None:
+        return flag
+    return os.environ.get(_OUTPUT_DIR_ENV) or "."
 
-    Finalizes (manifest + log + summary) on normal completion or on ``KeyboardInterrupt``.
+
+def _install_signal_handlers(stop_flag: threading.Event) -> None:
+    """Make SIGTERM/SIGINT request a graceful stop (so the container finalizes on shutdown)."""
+    def _handler(_signum, _frame):
+        stop_flag.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass  # not in the main thread, or unsupported on this platform
+
+
+def run_session(
+    config: SessionConfig,
+    *,
+    max_seconds: float | None = None,
+    session_id: str | None = None,
+    stop_flag: threading.Event | None = None,
+) -> Path:
+    """Record a configured session; finalize (manifest + log + summary) and return its directory.
+
+    Runs until ``max_seconds`` elapses (when given), ``stop_flag`` is set (by a signal or a control
+    ``stop``), or ``KeyboardInterrupt``. With ``max_seconds=None`` and no stop request it runs
+    indefinitely — the container mode.
     """
     session_id = session_id or _new_session_id()
     base_dir = Path(config.output_dir)
+    stop_flag = stop_flag if stop_flag is not None else threading.Event()
     specs = [
         build_spec(sc, recording_profiles=config.recording_profiles) for sc in config.sensors
     ]
@@ -149,9 +175,9 @@ def run_session(
     )
     supervisor.start()
     next_status = time.monotonic()
+    deadline = None if max_seconds is None else time.monotonic() + max_seconds
     try:
-        deadline = time.monotonic() + max_seconds
-        while time.monotonic() < deadline:
+        while not stop_flag.is_set() and (deadline is None or time.monotonic() < deadline):
             supervisor.tick()
             now = time.monotonic()
             if now >= next_status:
@@ -175,22 +201,25 @@ def main(argv: list[str] | None = None) -> int:
         help="path to sensors.yaml; omit to auto-discover devices",
     )
     run.add_argument(
-        "--seconds", type=float, default=_DEFAULT_SECONDS,
-        help="how long to record before finalizing (default: %(default)s)",
+        "--seconds", type=float, default=None,
+        help="record for this many seconds (default: run until stopped)",
     )
     run.add_argument(
-        "--output-dir", default=_DEFAULT_OUTPUT_DIR,
-        help="where to write recordings when auto-discovering (default: %(default)s)",
+        "--output-dir", default=None,
+        help=f"where to write recordings (default: ${_OUTPUT_DIR_ENV} or the cwd)",
     )
 
     args = parser.parse_args(argv)
     if args.command == "run":
+        output_dir = _resolve_output_dir(args.output_dir)
         try:
-            config = _resolve_config(args.config, output_dir=args.output_dir)
+            config = _resolve_config(args.config, output_dir=output_dir)
         except ConfigError as exc:
             print(f"{exc.code.code} {exc}")
             return 1
-        sdir = run_session(config, max_seconds=args.seconds)
+        stop_flag = threading.Event()
+        _install_signal_handlers(stop_flag)
+        sdir = run_session(config, max_seconds=args.seconds, stop_flag=stop_flag)
         print(f"session written to {sdir}")
         return 0
     return 2
