@@ -23,7 +23,10 @@ from mmco.core.errors import ErrorCode
 from mmco.core.logevent import LogEvent, LogLevel
 from mmco.host.control import Control, LogChannel
 from mmco.host.driver_host import HostSpec, spawn_driver_host
+from mmco.paths import session_dir, session_log_path
 from mmco.record.recorder import Recorder
+from mmco.record.session_log import write_log
+from mmco.record.summary import write_summary
 from mmco.supervisor.identity import IdentityRegistry
 from mmco.supervisor.policy import RestartPolicy
 from mmco.supervisor.watchdog import Watchdog
@@ -225,6 +228,10 @@ class Supervisor:
             self.aggregated_logs.extend(rt.log_channel.drain(timeout=0.1))
             self._recorder.note_dropped(sensor_id, rt.consumer.dropped)
         manifest_file = self._recorder.stop()
+        # Self-documenting session: write the log and the human-readable summary alongside it.
+        sdir = session_dir(self._base_dir, self._session_id)
+        write_log(str(session_log_path(sdir)), self.aggregated_logs)
+        write_summary(sdir)
         for rt in self._runtimes.values():
             rt.metaqueue.close()
             rt.log_channel.close()
