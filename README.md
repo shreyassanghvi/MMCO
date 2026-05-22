@@ -16,16 +16,18 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 7 complete (control surface green); Phase 8 next.
-**Active branch:** `impl/phase-7-control-surface` (off `master`).
+**Current stage:** Phase 8 complete (device discovery + out-of-box green); Phase 9 next.
+**Active branch:** `impl/phase-8-device-discovery` (off `master`).
 **Last updated:** 2026-05-22.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 104 passing
-(2 skipped: POSIX-only shared-memory sweep tests, skipped on Windows). Then
-`mmco run sensors.yaml --seconds 10` records a configured session — printing a live per-sensor
-status table — and finalizes `manifest.json` + `session.log.jsonl` + `summary.md` on completion or
-Ctrl-C. Kill or unplug a sensor mid-session and the others keep recording while it auto-reconnects —
-the summary names the fault in plain English with its error code.
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 113 passing
+(2 skipped: POSIX-only shared-memory sweep tests, skipped on Windows). Then `mmco run` (no config)
+auto-discovers plugged-in devices and **falls back to the simulated sensor when nothing runnable is
+found**, so a fresh clone always records; `mmco run sensors.yaml --seconds 10` records a configured
+session instead. Either way it prints a live per-sensor status table and finalizes `manifest.json` +
+`session.log.jsonl` + `summary.md` on completion or Ctrl-C. Kill or unplug a sensor mid-session and
+the others keep recording while it auto-reconnects — the summary names the fault in plain English
+with its error code.
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -45,8 +47,8 @@ the summary names the fault in plain English with its error code.
 | 5  | Supervisor: health & graceful degradation | ✅ Done — watchdog, gap logging, backoff restart, identity resume |
 | 6  | Session log + auto-summary | ✅ Done — session.log.jsonl + readable summary.md, auto-generated |
 | 7  | Control surface: config, CLI, live status | ✅ Done — YAML config + profiles, `mmco run`, live status table |
-| 8  | Device discovery + default session + out-of-box | 🔜 Next |
-| 9  | USB webcam (V4L2) driver + video writer | ⬜ Not started |
+| 8  | Device discovery + default session + out-of-box | ✅ Done — injectable enumerators + stable identity, default-session builder, sim fallback, `mmco run` no-arg |
+| 9  | USB webcam (V4L2) driver + video writer | 🔜 Next |
 | 10 | Containerization & one-command launch | ⬜ Not started |
 
 Legend: ✅ done · 🔜 next up · ⬜ not started
@@ -60,6 +62,10 @@ Legend: ✅ done · 🔜 next up · ⬜ not started
   `multiprocessing` objects should be created from a single shared `spawn` context. Run the full suite
   (especially `tests/host/`) under WSL2/Linux and confirm green before relying on the cross-process
   path there.
+- **Real device-enumerator validation (Phase 8).** Discovery's default enumerators glob `/dev`
+  (`/dev/video*`, `/dev/ttyUSB*`/`/dev/ttyACM*`, `/dev/snd/pcmC*c`) and resolve stable identities via
+  `/dev/by-id`; they return empty off Linux, so the suite covers the logic with injected fakes only.
+  Confirm the real enumerators against actual hardware on Linux/WSL2 (USB attach needs `usbipd-win`).
 
 ---
 
