@@ -34,6 +34,7 @@ class SensorConfig:
     identity: str | None = None
     protocol: str | None = None
     profile_override: dict = field(default_factory=dict)
+    latency_offset_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,7 @@ def _parse_sensor(raw: object, index: int) -> SensorConfig:
         identity=raw.get("identity"),
         protocol=raw.get("protocol"),
         profile_override=override,
+        latency_offset_ns=int(raw.get("latency_offset_ns", 0)),
     )
 
 

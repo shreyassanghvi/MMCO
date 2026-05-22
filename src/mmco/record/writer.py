@@ -3,7 +3,11 @@
 A :class:`StreamWriter` turns a stream's events into one native file, tracking the first/last
 ``t_event`` so the recorder can build a manifest segment. Writers are selected per
 :class:`~mmco.core.capabilities.StreamType` through a small registry; merging this with the driver
-entry-point plugin mechanism (so a stream type ships driver + writer together) is Phase 8.
+entry-point plugin mechanism (so a stream type ships driver + writer together) is future work.
+
+A writer also receives the sensor's resolved **recording profile** (a plain dict of
+container/codec/crf, etc., from ``resolve_profile``). Writers that don't encode (e.g. parquet)
+ignore it; the video writer honors it.
 """
 
 from __future__ import annotations
@@ -16,9 +20,12 @@ from mmco.core.capabilities import Capabilities, StreamType
 class StreamWriter(ABC):
     """Writes one stream's events to a single file and tracks its time span."""
 
-    def __init__(self, *, capabilities: Capabilities, file_path: str):
+    def __init__(
+        self, *, capabilities: Capabilities, file_path: str, profile: dict | None = None
+    ):
         self._capabilities = capabilities
         self._file_path = file_path
+        self._profile = profile or {}
         self._start: int | None = None
         self._end: int | None = None
 
@@ -62,11 +69,15 @@ def register_writer(stream_type: StreamType, cls: type[StreamWriter]) -> None:
 
 
 def writer_for(
-    stream_type: StreamType, *, capabilities: Capabilities, file_path: str
+    stream_type: StreamType,
+    *,
+    capabilities: Capabilities,
+    file_path: str,
+    profile: dict | None = None,
 ) -> StreamWriter:
     """Construct the registered writer for ``stream_type``; raise if none is registered."""
     try:
         cls = _REGISTRY[stream_type]
     except KeyError:
         raise ValueError(f"no writer registered for {stream_type}") from None
-    return cls(capabilities=capabilities, file_path=file_path)
+    return cls(capabilities=capabilities, file_path=file_path, profile=profile)

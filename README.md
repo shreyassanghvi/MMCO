@@ -16,18 +16,20 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 8 complete (device discovery + out-of-box green); Phase 9 next.
-**Active branch:** `impl/phase-8-device-discovery` (off `master`).
+**Current stage:** Phase 9 complete (webcam + video writer green); Phase 10 next.
+**Active branch:** `impl/phase-9-webcam-video` (off `master`).
 **Last updated:** 2026-05-22.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 113 passing
+Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 126 passing
 (2 skipped: POSIX-only shared-memory sweep tests, skipped on Windows). Then `mmco run` (no config)
-auto-discovers plugged-in devices and **falls back to the simulated sensor when nothing runnable is
-found**, so a fresh clone always records; `mmco run sensors.yaml --seconds 10` records a configured
-session instead. Either way it prints a live per-sensor status table and finalizes `manifest.json` +
-`session.log.jsonl` + `summary.md` on completion or Ctrl-C. Kill or unplug a sensor mid-session and
-the others keep recording while it auto-reconnects — the summary names the fault in plain English
-with its error code.
+auto-discovers plugged-in devices — a USB webcam records to `mp4` (with a per-frame timestamp
+sidecar) alongside tabular streams — and **falls back to the simulated sensor when nothing runnable
+is found**, so a fresh clone always records; `mmco run sensors.yaml --seconds 10` records a
+configured session instead. Either way it prints a live per-sensor status table and finalizes
+`manifest.json` + `session.log.jsonl` + `summary.md` on completion or Ctrl-C. Kill or unplug a sensor
+mid-session and the others keep recording while it auto-reconnects into a new segment — the summary
+names the fault in plain English with its error code. Running the real webcam on hardware:
+[`docs/hardware-checklist.md`](docs/hardware-checklist.md).
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -48,8 +50,8 @@ with its error code.
 | 6  | Session log + auto-summary | ✅ Done — session.log.jsonl + readable summary.md, auto-generated |
 | 7  | Control surface: config, CLI, live status | ✅ Done — YAML config + profiles, `mmco run`, live status table |
 | 8  | Device discovery + default session + out-of-box | ✅ Done — injectable enumerators + stable identity, default-session builder, sim fallback, `mmco run` no-arg |
-| 9  | USB webcam (V4L2) driver + video writer | 🔜 Next |
-| 10 | Containerization & one-command launch | ⬜ Not started |
+| 9  | USB webcam (V4L2) driver + video writer | ✅ Done — webcam driver (fake-capture seam), PyAV mp4 writer + timestamp sidecar, ±2 ms alignment |
+| 10 | Containerization & one-command launch | 🔜 Next |
 
 Legend: ✅ done · 🔜 next up · ⬜ not started
 
@@ -66,6 +68,10 @@ Legend: ✅ done · 🔜 next up · ⬜ not started
   (`/dev/video*`, `/dev/ttyUSB*`/`/dev/ttyACM*`, `/dev/snd/pcmC*c`) and resolve stable identities via
   `/dev/by-id`; they return empty off Linux, so the suite covers the logic with injected fakes only.
   Confirm the real enumerators against actual hardware on Linux/WSL2 (USB attach needs `usbipd-win`).
+- **Real webcam V4L2 backend (Phase 9).** The webcam driver's `v4l2` backend (PyAV opening
+  `/dev/videoN`) only runs on Linux; every test uses the deterministic fake-capture backend, and the
+  PyAV video writer encodes synthetic frames (works cross-platform, incl. Windows). Validate the real
+  camera path via [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
 
 ---
 

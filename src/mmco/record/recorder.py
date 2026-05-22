@@ -16,12 +16,23 @@ from mmco.core.clock import ClockAnchor, OffsetRegistry
 from mmco.core.errors import ErrorCode
 from mmco.core.manifest import Gap, Segment
 from mmco.paths import manifest_path, session_dir
-from mmco.record import parquet_writer  # noqa: F401  (registers the tabular writer)
+from mmco.record import (
+    parquet_writer,  # noqa: F401  (registers the tabular writer)
+    video_writer,  # noqa: F401  (registers the video writer)
+)
 from mmco.record.manifest_author import ManifestAuthor
 from mmco.record.writer import StreamWriter, writer_for
 
-# File suffix per stream type (more types arrive with their writers in later phases).
-_SUFFIX: dict[StreamType, str] = {StreamType.TABULAR: "parquet"}
+# File suffix per stream type (the video container can be overridden per profile, below).
+_SUFFIX: dict[StreamType, str] = {StreamType.TABULAR: "parquet", StreamType.VIDEO: "mp4"}
+_CONTAINER_EXT: dict[str, str] = {"mp4": "mp4", "matroska": "mkv", "mkv": "mkv"}
+
+
+def _suffix_for(stream_type: StreamType, profile: dict) -> str:
+    """The file extension for a stream, honoring a video profile's ``container`` override."""
+    if stream_type is StreamType.VIDEO:
+        return _CONTAINER_EXT.get(profile.get("container", "mp4"), "mp4")
+    return _SUFFIX[stream_type]
 
 
 class Recorder:
@@ -36,12 +47,14 @@ class Recorder:
         base_dir: Path,
         anchor: ClockAnchor,
         consumer: BusConsumer | None = None,
+        profiles: dict[str, dict] | None = None,
     ):
         # ``consumer`` is optional: a single-stream caller uses ``record_available`` to poll it,
         # while the supervisor owns per-sensor consumers and feeds events via ``record``.
         self._consumer = consumer
         self._capabilities = capabilities
         self._offsets = offsets
+        self._profiles = profiles or {}
         self._session_id = session_id
         self._session_dir = session_dir(base_dir, session_id)
         self._author = ManifestAuthor(
@@ -64,10 +77,14 @@ class Recorder:
         if writer is not None:
             return writer
         caps = self._capabilities[sensor_id]
+        profile = self._profiles.get(sensor_id, {})
         index = self._block_index.get(sensor_id, 0)
-        rel = f"{sensor_id}-{index:03d}.{_SUFFIX[caps.type]}"
+        rel = f"{sensor_id}-{index:03d}.{_suffix_for(caps.type, profile)}"
         writer = writer_for(
-            caps.type, capabilities=caps, file_path=str(self._session_dir / rel)
+            caps.type,
+            capabilities=caps,
+            file_path=str(self._session_dir / rel),
+            profile=profile,
         )
         writer.open()
         if sensor_id not in self._registered:

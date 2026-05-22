@@ -28,8 +28,8 @@ _DTYPES: dict[str, tuple[str, pa.DataType]] = {
 class ParquetWriter(StreamWriter):
     """Batches tabular rows to a parquet file with a per-row ``t_event`` column."""
 
-    def __init__(self, *, capabilities: Capabilities, file_path: str):
-        super().__init__(capabilities=capabilities, file_path=file_path)
+    def __init__(self, *, capabilities: Capabilities, file_path: str, profile: dict | None = None):
+        super().__init__(capabilities=capabilities, file_path=file_path, profile=profile)
         columns = capabilities.schema.columns
         self._names = [c.name for c in columns]
         self._arrow_types = [_DTYPES[c.dtype][1] for c in columns]

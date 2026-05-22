@@ -1297,24 +1297,157 @@ Real drivers (webcam in Phase 9) plug into the same builder with no change to di
 
 **Goal:** Prove the heavy real-hardware path and complete the full slice.
 
-**Tasks**
-- **9.1 Webcam driver (V4L2)** — open by **stable identity** (resolve to the current `/dev/videoN`),
-  read frames, return payload bytes for the host to copy; declare video capabilities; emit coded log
-  events on open/disconnect. *Tested by:* unit tests against a **fake-V4L2 seam** (no hardware) covering
-  open/read/close, disconnect (`E004`), and **reconnect on a different `/dev` index** resolving via
-  stable identity.
-- **9.2 Video writer (PyAV/ffmpeg)** — encode frames to mp4/mkv; record per-frame timestamps for the
-  manifest. *Tested by:* synthetic frames → valid playable file; frame count + timing correct.
-- **9.3 Latency offset for webcam** — declared/measured offset entry so video aligns with the tabular
-  stream. *Tested by:* offset applied in manifest; alignment-within-tolerance integration assertion.
-- **9.4 Manual hardware checklist** — documented steps to run the webcam on real Linux, incl. the
-  `usbipd-win` attach note for WSL2. *(Docs, not a test.)*
+**Branch:** `impl/phase-9-webcam-video` (off `master`, after Phase 8 merge).
 
-**Files:** `src/mmco/drivers/webcam_v4l2.py`, `src/mmco/record/video_writer.py`,
-`docs/hardware-checklist.md`; `tests/drivers/test_webcam_v4l2.py`, `tests/record/test_video_writer.py`.
+**Design decisions (locked for this phase):**
+- **New runtime dependency: PyAV (`av`).** The `av` wheel bundles ffmpeg, so encoding synthetic frames
+  should work cross-platform. Task 9.2 **begins by installing `av` and verifying a trivial encode runs
+  on the Windows dev box.** If PyAV cannot run on Windows, the video-writer + video-integration tests
+  are marked skip-on-non-Linux (the same pattern as the existing POSIX-only shm-sweep skips) and are
+  validated on Linux/WSL2 — this would be **flagged as a deviation** and noted in the README. Decided
+  at implementation time from the actual install result.
+- **V4L2 is Linux-only -> capture-backend seam.** The webcam driver is built against an injectable
+  frame-source backend plus an identity->node resolver. The **fake backend** (deterministic synthetic
+  frames, scriptable disconnect, scriptable node on reconnect) drives every unit test with no hardware;
+  the real V4L2 backend is thin and hardware-validated via the checklist (9.5). The driver opens by
+  **stable identity** (resolver maps it to the current `/dev/videoN`), reads raw frame bytes, and
+  classifies a vanished device as `DeviceDisconnectedError` (`E004`).
+- **Spawn-safe backend selection.** Because the host runs each driver cross-process via `spawn`, the
+  webcam config selects its backend **by name** (`"v4l2"` | `"fake"`) plus plain parameters — never a
+  serialized closure (mirrors `SimConfig`'s failure-mode-by-name). The driver builds the real or fake
+  backend at `open()` in the child.
+- **Small synthetic resolution in tests.** The spec sizes a real video ring for 4K; tests use a small
+  frame (e.g. 64x48 RGB) so ring slot size and encode time stay tiny. Capabilities/`VideoSchema`
+  declare the real dimensions; nothing hardcodes 4K.
+- **Closes the "offsets are never populated" gap.** Phase 4 built the offset math but nothing ever
+  sets a sensor's offset, so every `latency_offset` is currently 0. Task 9.3 threads a **declared
+  latency offset** from the config/`SensorSpec` into the recorder's `OffsetRegistry`, so it both
+  corrects `t_event` and lands in the manifest block — this is what makes the webcam align with the
+  tabular stream.
+- **Profile reaches the writer.** Phase 7's `resolve_profile` had no consumer. Task 9.2 threads a
+  resolved profile (codec/crf/container) through the recorder to the video writer (the writer contract
+  gains an optional `profile`; the parquet writer ignores it). The webcam slice exercises the `crf`
+  override from spec §5.1.
+- **The alignment guarantee is tested deterministically, no hardware (spec §9).** The ±2 ms cross-
+  stream alignment assertion runs against simulated streams with a declared offset (always-green CI);
+  the real webcam-with-video end-to-end on hardware is the **manual checklist** (9.5). Sim + webcam
+  *together through the supervisor* is exercised with the **fake backend** (9.4) — full bus -> recorder
+  -> video writer -> manifest path, plus a disconnect->`E004`->reconnect moment.
+- **Build order:** 9.1 driver -> 9.2 video writer + profile passthrough -> 9.3 offset threading +
+  alignment -> 9.4 sim+webcam(fake) integration + CLI registry -> 9.5 hardware checklist + gate.
+- Commands via the venv interpreter; ruff exit code checked directly.
 
-**Outcome:** Full slice: simulated + webcam recording together; unplug/kill the webcam → gap + error code
-logged → auto-reconnect; aligned mp4 + parquet + manifest + summary.
+### Task 9.1 — Webcam driver (V4L2) behind a fake-capture seam
+
+**Files:** create `src/mmco/drivers/webcam_v4l2.py`, `tests/drivers/test_webcam_v4l2.py`.
+(Spec §3.1, §6, §9.)
+
+`WebcamConfig` (`sensor_id`, `identity`, `width`, `height`, `fps`, `backend="v4l2"`, plus fake-only
+params: scripted frames, `disconnect_after`, scripted reconnect node). `WebcamDriver(SensorDriver)`
+opens by resolving `identity` -> current node, reads raw frame bytes into a `DriverSample`, declares
+`Capabilities(VIDEO, rate=fps, VideoSchema(...))`, and raises `DeviceDisconnectedError` when the
+backend reports the device gone. Backend + resolver are selected by name so the driver is spawn-safe.
+
+- [ ] **Step 1 — Failing tests (fake backend).** open->read yields frame bytes of the expected length
+  and a video schema ref; `read()` after `disconnect_after` raises `DeviceDisconnectedError`;
+  **reconnect-on-different-index** — the resolver returns a new node for the same identity on re-open
+  and the driver reads again (proves identity-not-index binding); `capabilities` reports VIDEO at the
+  configured fps/dimensions.
+- [ ] **Step 2 — RED.** `python -m pytest tests/drivers/test_webcam_v4l2.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `webcam_v4l2.py` with the config, the driver, the fake backend +
+  resolver (deterministic), and a thin real-V4L2 backend stub (best-effort; hardware-validated later).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Webcam: V4L2 driver opening by stable identity behind a fake-capture seam`.
+
+### Task 9.2 — Video writer (PyAV) + per-frame timestamps + profile passthrough
+
+**Files:** modify `pyproject.toml` (add `av`); create `src/mmco/record/video_writer.py`,
+`tests/record/test_video_writer.py`; extend `src/mmco/record/{writer.py,recorder.py}`. (Spec §5.)
+
+`VideoWriter(StreamWriter)` registered for `StreamType.VIDEO`: `open()` builds an `av` output
+container + video stream from the resolved profile (codec/crf/container; sensible defaults when
+absent); `write_event` decodes raw frame bytes -> frame, encodes/muxes, records the per-frame
+`t_event`; `close()` flushes and writes a **per-frame timestamp sidecar** (`t_event` + frame index,
+mirroring the parquet `t_event` approach). The `StreamWriter` contract gains an optional `profile`;
+the recorder passes a per-sensor resolved profile and maps `VIDEO -> mp4` (container from profile).
+
+- [ ] **Step 1 — Add the dependency + verify.** Add `av` to `[project.dependencies]`; run
+  `python -m pip install -e ".[dev]"`; verify a trivial synthetic-frame encode runs on Windows. If it
+  cannot, gate the video tests skip-on-non-Linux and note the deviation (decision recorded here).
+- [ ] **Step 2 — Failing tests.** Synthetic frames -> a playable output file that re-opens and decodes
+  the **expected frame count**; the sidecar lists one `t_event` per frame, monotonic, matching what was
+  written; `start/end_timestamp` track first/last; a `crf`/codec from the profile is honored (file
+  opens with the requested codec). A recorder-level test: a VIDEO sensor with a resolved profile writes
+  an mp4 segment into the manifest.
+- [ ] **Step 3 — RED.** `python -m pytest tests/record/test_video_writer.py -v` → FAIL.
+- [ ] **Step 4 — Implement.** Add `video_writer.py`; extend the `StreamWriter` contract + `writer_for`
+  with an optional `profile`; teach the recorder the VIDEO suffix and per-sensor profile passthrough.
+- [ ] **Step 5 — GREEN.** pass.
+- [ ] **Step 6 — Commit.** `Video Writer: encode frames via PyAV with a per-frame timestamp sidecar`.
+
+### Task 9.3 — Declared latency offset + cross-stream alignment (±2 ms)
+
+**Files:** extend `src/mmco/supervisor/supervisor.py` (carry offset on `SensorSpec`), `cli/main.py`
+(offset + resolved profile from config); create `tests/integration/test_alignment.py`. (Spec §4.2, §9.)
+
+Thread a declared latency offset from config -> `SensorSpec` -> the recorder's `OffsetRegistry` so
+`t_event = t_acquire − offset` and the manifest block's `latency_offset` is non-zero. Resolve each
+sensor's recording profile (`resolve_profile`) and hand it to the recorder for its writer.
+
+- [ ] **Step 1 — Failing tests.** Unit: a declared offset reaches the manifest block's `latency_offset`
+  and corrects `t_event` (read back the parquet `t_event` against the expected schedule). Integration
+  (`test_alignment.py`): a simulated reference stream's recorded corrected timestamps track the
+  expected monotonic schedule **within ±2 ms** (offset correction validated end to end, no hardware).
+- [ ] **Step 2 — RED.** run the new tests → FAIL.
+- [ ] **Step 3 — Implement.** Add `latency_offset_ns` to `SensorConfig`/`SensorSpec`; populate the
+  `OffsetRegistry` at supervisor start; resolve + pass profiles; wire both through `cli/main.build_spec`.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Alignment: thread declared latency offset and assert ±2 ms cross-stream`.
+
+### Task 9.4 — Sim + webcam (fake) end-to-end + CLI registry
+
+**Files:** modify `src/mmco/cli/main.py` (register `webcam_v4l2`); create
+`tests/integration/test_webcam_session.py`. (Spec §6, §8.)
+
+Run a supervised session with one simulated sensor and one webcam sensor on the **fake backend**
+(spawn-safe), recording together. Register `webcam_v4l2` in the CLI driver registry so a discovered
+camera auto-joins `mmco run` (Windows finds none -> still falls back to simulated).
+
+- [ ] **Step 1 — Failing test.** A session with sim + fake-webcam finalizes `manifest.json` + the mp4 +
+  the parquet + `summary.md`; both streams appear as manifest blocks. Inject the webcam's
+  `disconnect_after` -> a coded **`E004`** gap is logged for the webcam, the simulated stream keeps
+  recording, and the webcam **reconnects into a new segment**. Assert `runnable_driver_names()` now
+  includes `webcam_v4l2`.
+- [ ] **Step 2 — RED.** `python -m pytest tests/integration/test_webcam_session.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add a `webcam_v4l2` builder to the CLI driver registry (real V4L2 backend
+  by default; the test builds specs with the fake backend directly). Size the video ring from
+  capabilities.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `CLI: register the webcam driver and record sim + webcam together`.
+
+### Task 9.5 — Hardware checklist + Phase 9 gate
+
+**Files:** create `docs/hardware-checklist.md`; update `README.md`. (Spec §7, §9.)
+
+- [ ] **Step 1 — Hardware checklist.** Document running the webcam on real Linux: install ffmpeg/`av`,
+  the `usbipd-win` USB-attach steps for WSL2, identifying the camera's stable identity, and the expected
+  `mmco run` output incl. the unplug->gap->reconnect demo. *(Docs, not a test.)*
+- [ ] **Step 2 — Full suite + lint.** `python -m pytest` → all green (Linux-only checks skip on
+  Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 3 — Update README.** Flip Phase 9 to ✅, Phase 10 to 🔜; refresh test count + stage line;
+  note PyAV as a dependency and (if applicable) any video-test skip-on-Windows + Linux-validation
+  follow-up.
+- [ ] **Step 4 — Commit.** `Docs: add hardware checklist and mark Phase 9 complete`.
+
+**Files (Phase 9 total):** `src/mmco/drivers/webcam_v4l2.py`, `src/mmco/record/video_writer.py`;
+extensions to `record/{writer,recorder}.py`, `supervisor/supervisor.py`, `cli/main.py`,
+`config/config.py`, `pyproject.toml`; `docs/hardware-checklist.md`; `tests/drivers/test_webcam_v4l2.py`,
+`tests/record/test_video_writer.py`, `tests/integration/test_alignment.py`,
+`tests/integration/test_webcam_session.py`.
+
+**Outcome:** Full slice — simulated + webcam recording together; unplug/kill the webcam -> coded gap ->
+auto-reconnect into a new segment; aligned mp4 + parquet + manifest + summary. The webcam-on-hardware
+path is documented in the checklist; everything else is hardware-free and always-green in CI.
 
 ---
 

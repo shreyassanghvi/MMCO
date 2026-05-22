@@ -47,6 +47,8 @@ class SensorSpec:
     driver_factory: object
     driver_config: object
     capabilities: Capabilities
+    latency_offset_ns: int = 0
+    profile: dict | None = None
 
 
 @dataclass
@@ -93,12 +95,16 @@ class Supervisor:
         """Sweep stale segments, build per-sensor runtimes, and spawn every host."""
         sweep_stale_segments()
         anchor = self._clock.capture_anchor()
+        offsets = OffsetRegistry()
+        for spec in self._specs:
+            offsets.set(spec.sensor_id, spec.latency_offset_ns)
         self._recorder = Recorder(
             capabilities={s.sensor_id: s.capabilities for s in self._specs},
-            offsets=OffsetRegistry(),
+            offsets=offsets,
             session_id=self._session_id,
             base_dir=self._base_dir,
             anchor=anchor,
+            profiles={s.sensor_id: (s.profile or {}) for s in self._specs},
         )
         self._recorder.start()
         now = time.monotonic()
