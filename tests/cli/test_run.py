@@ -33,3 +33,8 @@ def test_run_session_finalizes_all_artifacts(tmp_path):
 def test_main_run_returns_zero(tmp_path):
     cfg = _write_config(tmp_path)
     assert main(["run", str(cfg), "--seconds", "1"]) == 0
+
+
+def test_main_run_no_config_auto_discovers(tmp_path):
+    # No config path → discovery (empty on the dev box) → simulated fallback → records cleanly.
+    assert main(["run", "--seconds", "1", "--output-dir", str(tmp_path)]) == 0
