@@ -21,6 +21,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from mmco.cli.status_view import render_status
 from mmco.config.config import ConfigError, SensorConfig, SessionConfig, load_config
 from mmco.core.capabilities import Capabilities, Column, StreamType, TabularSchema
 from mmco.drivers.simulated import SimConfig, SimulatedDriver
@@ -30,6 +31,7 @@ from mmco.supervisor.supervisor import SensorSpec, Supervisor
 
 _DEFAULT_SECONDS = 10.0
 _TICK_S = 0.05
+_STATUS_EVERY_S = 1.0
 _N_SLOTS = 16
 _SLOT_SIZE = 64
 
@@ -88,10 +90,15 @@ def run_session(
         policy=RestartPolicy(base_s=0.5, cap_s=5.0),
     )
     supervisor.start()
+    next_status = time.monotonic()
     try:
         deadline = time.monotonic() + max_seconds
         while time.monotonic() < deadline:
             supervisor.tick()
+            now = time.monotonic()
+            if now >= next_status:
+                print(render_status(supervisor.snapshot()))
+                next_status = now + _STATUS_EVERY_S
             time.sleep(_TICK_S)
     except KeyboardInterrupt:
         print("\nstopping (Ctrl-C) — finalizing session...")
