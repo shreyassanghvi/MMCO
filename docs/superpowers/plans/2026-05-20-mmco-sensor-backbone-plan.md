@@ -745,31 +745,189 @@ recorder}.py`; `tests/record/test_*.py`; `tests/integration/test_session_simulat
 
 **Goal:** Make the box resilient — a sensor can crash, hang, or vanish and the session survives.
 
-**Tasks**
-- **5.1 Supervisor spawn/monitor + shm ownership** — spawn driver hosts, track liveness, collect log
-  events, **own the shm lifecycle** (create/`unlink`/recreate a driver's segment across restarts; sweep
-  stale segments on startup), clean shutdown of all on stop. *Tested by:* N drivers start/stop cleanly;
-  no leaked processes or shared memory after a crash; log events aggregated.
-- **5.2 Watchdog & health policy** — detect crash (process exit → `E002`), hang (no events past a
-  **per-stream watchdog timeout derived from the declared `rate`** → `E003`), and device-gone (`E004`).
-  *Tested by:* sim failure modes (crash/hang/slow) each detected and mapped to the right code; a
-  legitimately slow-but-alive stream is **not** falsely killed.
-- **5.3 Gap logging** — on detection, **close the current segment**, append `{start, end, reason, code}`
-  to the stream's manifest block, **emit a `LogEvent` with the code**, while **other streams keep
-  recording**. *Tested by:* multi-driver session, one fails → gap + coded log recorded, others
-  uninterrupted.
-- **5.4 Restart with capped backoff + resume by stable identity** — re-spawn the dead driver with
-  exponential backoff **up to a cap** (a device gone all session settles into the all-gap state, no
-  spin-loop); on recovery the driver re-opens by **stable identity (by-id / VID:PID:serial), not the
-  old `/dev` index**, and resumed data starts a **new segment** with the gap preserved; emit a reconnect
-  `LogEvent`. *Tested by:* sim crash → re-spawn → resumes into a new segment; manifest shows gap then
-  new segment; reconnect on a *different* device index still binds the right sensor.
-- **5.5 Recorder write-failure policy** — a writer error / disk-full (`E007`) closes the affected
-  stream's segment and opens a gap (like a stream fault) **without crashing the core**; other streams
-  keep recording. *Tested by:* injected write failure → coded gap + session survives.
+**Branch:** `impl/phase-5-supervisor` (off `master`, after Phase 4 merge).
 
-**Files:** `src/mmco/supervisor/supervisor.py`, `supervisor/watchdog.py`, `supervisor/policy.py`,
-`supervisor/identity.py`; `tests/supervisor/test_*.py`, `tests/integration/test_degradation.py`.
+**Design decisions (locked for this phase):**
+- **Per-sensor runtime.** Each sensor gets its own ring (sized from its capabilities), `MetaQueue`,
+  `Control`, `LogChannel`, host process, and `BusConsumer`. The **supervisor owns them all** and is the
+  single shm owner — it creates/`unlink`s/recreates a sensor's segment across restarts and sweeps stale
+  `mmco-*` segments at startup.
+- **Deterministic watchdog.** Health checks take an explicit monotonic `now` (and the host's liveness),
+  so tests inject time instead of sleeping. Hang timeout = `max(factor / rate_hz, floor_s)`.
+- **Error-code sources:** process exited unexpectedly → `E002`; no events past the watchdog timeout
+  while still alive → `E003`; the driver signalling device-gone (`DeviceDisconnectedError`) → `E004`
+  (a generic read error stays `E002`); a writer/disk failure → `E007`.
+- **Capped backoff, never give up.** `backoff(attempt) = min(base · 2^attempt, cap)`; a device gone all
+  session keeps retrying at the cap (the stream settles into an all-gap state — no spin-loop).
+- **Resume by stable identity into a new segment.** Re-spawn re-binds by the spec's stable `identity`
+  (by-id / VID:PID:serial), **not** a transient device index; resumed data opens a **new segment** with
+  the gap preserved between.
+- **Core never crashes on one stream's fault.** Stream and disk faults become coded gaps; the other
+  streams keep recording.
+- **Sim stays the fixture.** Add a `disconnect` failure mode (raises `DeviceDisconnectedError`) so
+  `E004` is exercisable with no hardware; the host classifies it.
+- **Build order (pure units first, integrator last):** 5.1 policy → 5.2 identity → 5.3 watchdog →
+  5.4 device-disconnect classification → 5.5 recorder gap/segment API → 5.6 supervisor →
+  5.7 recorder write-failure → 5.8 integration + gate. (Maps to spec §5 tasks 5.1–5.5.)
+- The cross-process degradation integration uses real child processes with generous timeouts; the
+  pending **Linux multiprocessing validation** (README "Known follow-ups") still applies. Commands run
+  via the venv interpreter; ruff exit code checked directly (not through a pipe).
+
+### Task 5.1 — Restart backoff policy (pure)
+
+**Files:** create `src/mmco/supervisor/__init__.py`, `src/mmco/supervisor/policy.py`,
+`tests/supervisor/__init__.py`, `tests/supervisor/test_policy.py`. (Spec §6, task 5.4.)
+
+A pure `RestartPolicy(base_s, cap_s)` with `backoff(attempt: int) -> float = min(base · 2^attempt,
+cap)`. No max-attempts: a permanently-gone device keeps retrying at the cap interval.
+
+- [ ] **Step 1 — Failing tests.** Assert: `backoff(0) == base_s`; it doubles per attempt
+  (`backoff(1) == 2·base_s`, `backoff(2) == 4·base_s`); it is **capped** (`backoff(100) == cap_s`);
+  and never exceeds `cap_s`.
+- [ ] **Step 2 — RED.** `python -m pytest tests/supervisor/test_policy.py -v` → FAIL (`No module
+  named 'mmco.supervisor'`).
+- [ ] **Step 3 — Implement.** Add `src/mmco/supervisor/__init__.py` and `policy.py` with the pure
+  `RestartPolicy`. Add empty `tests/supervisor/__init__.py`.
+- [ ] **Step 4 — GREEN.** `python -m pytest tests/supervisor/test_policy.py -v` → pass.
+- [ ] **Step 5 — Commit.** `Restart Policy: add capped exponential backoff`.
+
+### Task 5.2 — Device identity resolver (pure)
+
+**Files:** create `src/mmco/supervisor/identity.py`, `tests/supervisor/test_identity.py`.
+(Spec §6, task 5.4.)
+
+An `IdentityRegistry` mapping a stable device identity (by-id / `VID:PID:serial`) → `sensor_id`.
+`register(sensor_id, identity)` and `resolve(identity) -> sensor_id`; resolution is by **identity
+only**, independent of any transient device index.
+
+- [ ] **Step 1 — Failing tests.** Assert: `resolve` returns the registered `sensor_id` for an
+  identity; the **same identity presented with a different device index** still resolves to the same
+  sensor (model the index as a separate, ignored field); an unknown identity raises `KeyError`.
+- [ ] **Step 2 — RED.** `python -m pytest tests/supervisor/test_identity.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `identity.py` with the registry (dict identity → sensor_id).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Device Identity: add stable-identity resolver`.
+
+### Task 5.3 — Watchdog & health codes (deterministic)
+
+**Files:** create `src/mmco/supervisor/watchdog.py`, `tests/supervisor/test_watchdog.py`.
+(Spec §6, task 5.2.)
+
+A `Watchdog` with `register(sensor_id, rate_hz, factor, floor_s)`, `note_event(sensor_id, now)`, and
+`check(sensor_id, now, alive) -> ErrorCode | None`: returns `E002` if `not alive`; else `E003` if
+`now - last_event > timeout` (`timeout = max(factor / rate_hz, floor_s)`); else `None`. Time is passed
+in, so tests are deterministic.
+
+- [ ] **Step 1 — Failing tests.** Assert: a dead process (`alive=False`) → `ErrorCode.DRIVER_CRASH`
+  (`E002`); a live stream with no events past its timeout → `ErrorCode.WATCHDOG_TIMEOUT` (`E003`); a
+  live stream that **kept emitting within the timeout** (a legitimately slow-but-alive stream) → `None`
+  (not falsely killed); `note_event` resets the clock.
+- [ ] **Step 2 — RED.** `python -m pytest tests/supervisor/test_watchdog.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `watchdog.py` (per-sensor last-event map + timeout math; no real
+  sleeping).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Watchdog: add per-stream crash/hang health detection`.
+
+### Task 5.4 — Device-disconnect classification
+
+**Files:** modify `src/mmco/core/driver.py` (add `DeviceDisconnectedError`),
+`src/mmco/drivers/simulated.py` (add `disconnect` mode), `src/mmco/host/driver_host.py` (classify);
+extend `tests/drivers/test_simulated.py`, `tests/host/test_driver_host.py`. (Spec §6, task 5.2.)
+
+Add a `DeviceDisconnectedError` exception. The sim grows a `disconnect` failure mode (raises it after N
+reads). The host maps a `DeviceDisconnectedError` from `read()` to a `LogEvent(code=E004)` while any
+other exception stays `E002`.
+
+- [ ] **Step 1 — Failing tests.** Sim: with `failure="disconnect", failure_after=2`, the third `read()`
+  raises `DeviceDisconnectedError`. Host: a disconnect-mode sim makes the child emit a `LogEvent` with
+  `ErrorCode.DEVICE_DISCONNECTED` (and still exit cleanly).
+- [ ] **Step 2 — RED.** `python -m pytest tests/drivers/test_simulated.py tests/host/test_driver_host.py
+  -v` → FAIL (new assertions).
+- [ ] **Step 3 — Implement.** Add the exception + sim mode + host classification (catch
+  `DeviceDisconnectedError` first → `E004`; generic `Exception` → `E002`).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Device Disconnect: add sim disconnect mode and host E004 classification`.
+
+### Task 5.5 — Recorder gap logging + multi-segment resume
+
+**Files:** modify `src/mmco/record/manifest_author.py` (add `add_gap`), `src/mmco/record/recorder.py`
+(gap + new-segment API); create `tests/record/test_recorder_gaps.py`. (Spec §5, §6, tasks 5.3/5.4.)
+
+`ManifestAuthor.add_gap(sensor_id, gap)`. The `Recorder` gains `open_gap(sensor_id, start, end, reason,
+code)` — closes the current writer, records its `Segment`, and appends the `Gap` — and resumes into a
+**new segment** (incrementing `block_index`, new file `<sensor>-NNN.parquet`) on the next event.
+
+- [ ] **Step 1 — Failing test.** Drive a recorder in-process: write a few tabular events, call
+  `open_gap(...)` with a code, write a few more, stop. Assert the manifest has **two segments**
+  (`block_index` 0 then 1) with **one gap** carrying the code between them, both parquet files exist,
+  and the gap's `start/end` sit between the segments' times.
+- [ ] **Step 2 — RED.** `python -m pytest tests/record/test_recorder_gaps.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `add_gap` to the author; in the recorder, track `block_index` per
+  sensor, finalize-on-gap, and lazily open the next-indexed file on resume.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Recorder: add gap logging and multi-segment resume`.
+
+### Task 5.6 — Supervisor: spawn/monitor, shm ownership, degrade & restart
+
+**Files:** create `src/mmco/supervisor/supervisor.py`, `tests/supervisor/test_supervisor.py`.
+(Spec §3.1, §6, tasks 5.1/5.3/5.4.)
+
+A `Supervisor` given per-sensor specs: on `start` it sweeps stale segments, creates a ring + queues +
+channels per sensor, spawns each host, and registers each with the watchdog/identity. A `tick(now)`
+drains every consumer into the `Recorder`, feeds `note_event`, runs `watchdog.check`, and on a
+detection **opens a gap (coded) + emits a log + keeps the other streams running**, then **re-spawns**
+the dead host per the backoff policy (re-binding by identity) so it resumes into a new segment. `stop`
+requests stop on all hosts, joins them, writes the manifest, and `unlink`s every segment.
+
+- [ ] **Step 1 — Failing test (real child processes).** Start a supervisor with **two** sims, one in
+  `crash` mode. Pump `tick` for a bounded time, then `stop`. Assert: the manifest exists; the **healthy
+  stream has a continuous (single) segment** and kept recording; the **crashed stream shows a gap with
+  `ErrorCode.DRIVER_CRASH` and ≥ 2 segments** (resumed after re-spawn); a crash + reconnect `LogEvent`
+  were aggregated; and **no child process or `mmco-*` segment is leaked** after `stop` (the
+  segment-leak assertion is `skipif(win32)`).
+- [ ] **Step 2 — RED.** `python -m pytest tests/supervisor/test_supervisor.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `supervisor.py` composing the per-sensor runtimes, the watchdog,
+  identity, policy, and recorder; ensure clean teardown on every path.
+- [ ] **Step 4 — GREEN.** pass (generous timeouts).
+- [ ] **Step 5 — Commit.** `Supervisor: spawn/monitor hosts, own shm, degrade and restart`.
+
+### Task 5.7 — Recorder write-failure policy (E007)
+
+**Files:** modify `src/mmco/record/recorder.py` (catch writer errors); create
+`tests/record/test_recorder_write_failure.py`. (Spec §5, task 5.5.)
+
+A writer raising during `write_event`/`close` is caught by the recorder, which opens a coded gap
+(`ErrorCode.WRITER_FAILURE`, `E007`) for that stream **without crashing**; other streams keep
+recording.
+
+- [ ] **Step 1 — Failing test.** Register a fake writer that raises on `write_event` for one sensor;
+  drive the recorder with that sensor plus a healthy parquet sensor. Assert: the failing stream gets an
+  `E007` gap, the recorder does **not** raise, and the healthy stream still records its events + segment.
+- [ ] **Step 2 — RED.** `python -m pytest tests/record/test_recorder_write_failure.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Wrap writer calls in the recorder; on failure, open an `E007` gap and
+  drop the broken writer (so the stream settles into a gap) without propagating.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Recorder: treat writer failure as a coded gap (E007)`.
+
+### Task 5.8 — Integration + Phase 5 gate
+
+**Files:** create `tests/integration/test_degradation.py`.
+
+- [ ] **Step 1 — Degradation integration test.** Two simulated sensors; mid-session one is killed
+  (crash mode). Assert end-to-end via the manifest + logs: the killed stream shows **gap → new
+  segment** with the right code and a reconnect log; the other stream is **uninterrupted**; the core
+  never raised. (Generous timeouts; real child processes.)
+- [ ] **Step 2 — Full suite + lint.** `python -m pytest` → all phases green (Linux-only checks skip on
+  Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 3 — Update README.** Flip Phase 5 to ✅, Phase 6 to 🔜; refresh test count + stage line;
+  note the resilience demo works (kill a sensor, session survives + auto-reconnects).
+- [ ] **Step 4 — Commit.** `Docs: mark Phase 5 complete in progress README`.
+
+**Files (Phase 5 total):** `src/mmco/supervisor/{__init__,policy,identity,watchdog,supervisor}.py`;
+extensions to `core/driver.py`, `drivers/simulated.py`, `host/driver_host.py`,
+`record/{manifest_author,recorder}.py`; `tests/supervisor/test_*.py`,
+`tests/record/test_recorder_gaps.py`, `tests/record/test_recorder_write_failure.py`,
+`tests/integration/test_degradation.py`.
 
 **Outcome:** Kill/hang the simulated driver mid-session → other streams keep recording, gap + error code
 are logged, the driver auto-reconnects (by stable identity) into a new segment. The resilience demo
