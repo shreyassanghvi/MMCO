@@ -62,4 +62,17 @@ def build_default_session(
         sensor = _sensor_for(device, index)
         if sensor.driver in runnable_drivers:
             sensors.append(sensor)
+    if not sensors:
+        sensors.append(_simulated_sensor())
     return SessionConfig(output_dir=output_dir, sensors=sensors)
+
+
+def _simulated_sensor() -> SensorConfig:
+    """The always-available fallback so a fresh clone records even with no runnable hardware."""
+    return SensorConfig(
+        id="sim0",
+        driver=SIMULATED_DRIVER,
+        rate_hz=_SIM_RATE_HZ,
+        identity="sim0",
+        protocol="simulated",
+    )
