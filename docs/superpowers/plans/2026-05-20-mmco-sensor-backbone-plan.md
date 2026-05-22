@@ -1162,21 +1162,134 @@ printing a live status table; the status renderer reflects live per-sensor count
 
 **Goal:** `clone → one command → recording`, with no hand-editing.
 
-**Tasks**
-- **8.1 Device discovery** — enumerate `/dev/video*` (V4L2), ALSA/Pulse capture devices,
-  `/dev/ttyUSB*`/`/dev/ttyACM*`; match each to a capable driver and record its **stable identity**
-  (by-id path / USB VID:PID:serial) for reconnect. *Tested by:* discovery against a faked `/dev` +
-  mocked enumerators returns expected device list with stable identities.
-- **8.2 Default-session builder** — with no `sensors.yaml`, build a session from discovery; an explicit
-  config always overrides. *Tested by:* discovery results → sensible default session.
-- **8.3 Simulated fallback** — if nothing is found, default to the simulated sensor so a fresh clone
-  always records. *Tested by:* empty discovery → session contains the sim driver and produces a
-  recording.
+**Branch:** `impl/phase-8-device-discovery` (off `master`, after Phase 7 merge).
 
-**Files:** `src/mmco/discovery/discovery.py`, `discovery/default_session.py`; `tests/discovery/test_*.py`,
-`tests/integration/test_out_of_box.py`.
+**Design decisions (locked for this phase):**
+- **Only the simulated driver is runnable today.** The webcam (V4L2) driver lands in Phase 9; mic and
+  serial drivers are future work (spec §10). So Phase 8 builds the full discovery + default-session
+  *machinery* and tests it exhaustively, but the **runnable** path still falls back to simulated until
+  a real driver registers. Discovery still *enumerates and reports* real devices (with their stable
+  identity) — they just don't produce a runnable sensor yet. When Phase 9 registers `webcam_v4l2` in
+  the CLI driver registry, the same builder starts emitting webcam sensors automatically. This is the
+  honest seam; it is **flagged** so no one reads "auto-detects a webcam and records it" into Phase 8.
+- **Injectable enumerators (no hardware, cross-platform tests).** `discover_devices` takes injectable
+  per-kind enumerator callables. The default real enumerators are best-effort and Linux-oriented (glob
+  `/dev/video*`, `/dev/ttyUSB*`/`/dev/ttyACM*`, capture nodes under `/dev/snd`); they return an empty
+  list when the source is absent, so on the Windows dev box discovery yields nothing and the sim
+  fallback takes over. Tests inject **fake enumerators** — no real `/dev`, runs identically on Windows.
+  (Real-enumerator behavior on Linux/WSL2 joins the existing Linux-validation follow-up.)
+- **Stable identity is the contract.** Each discovered device carries a transient `node`
+  (e.g. `/dev/video0`) *and* a stable `identity` (by-id path / `VID:PID:serial`) — the latter is what a
+  `SensorConfig` binds to, so reconnect-by-identity (already built in Phase 5) keeps working when a
+  device re-enumerates at a new index.
+- **Builder maps kind → driver name, then filters to runnable.** The default-session builder maps each
+  device kind to a driver name (`video → webcam_v4l2`, `audio → alsa_mic`, `serial → serial_imu`),
+  then keeps only sensors whose driver is in the set of **runnable** drivers (the CLI registry keys —
+  today `{"simulated"}`). If that leaves zero runnable sensors, it appends one **simulated** sensor so
+  a fresh clone always records. An explicit `sensors.yaml` always overrides discovery (handled at the
+  CLI: discovery runs only when no config path is given).
+- **`mmco run` config arg becomes optional.** `mmco run` (no path) → discover → build default → run.
+  `mmco run sensors.yaml` is unchanged.
+- **Build order:** 8.1 discovery → 8.2 default-session builder → 8.3 simulated fallback → 8.4 CLI
+  no-arg run + out-of-box integration + gate.
+- Commands via the venv interpreter; ruff exit code checked directly.
 
-**Outcome:** `mmco run` (no args) auto-detects sensors or falls back to simulated, then records.
+### Task 8.1 — Device model + discovery with injectable enumerators
+
+**Files:** create `src/mmco/discovery/__init__.py`, `src/mmco/discovery/discovery.py`,
+`tests/discovery/test_discovery.py`. (Spec §3 component 7, §6 stable identity.)
+
+A `DeviceKind` enum (`VIDEO`, `AUDIO`, `SERIAL`); a frozen `DiscoveredDevice` (`kind`, `node`,
+`identity`, `description`). `discover_devices(*, enumerators=DEFAULT_ENUMERATORS) -> list[DiscoveredDevice]`
+runs each kind's enumerator and flattens the result, sorted deterministically (by kind then identity).
+Default real enumerators are best-effort and return `[]` when their source is absent.
+
+- [ ] **Step 1 — Failing tests.** With **fake enumerators** injected (one fake video device with a
+  by-id identity, one fake serial device): `discover_devices` returns both as `DiscoveredDevice`s with
+  the expected `kind`/`node`/`identity`, in deterministic order. With no enumerators (or all empty):
+  returns `[]`. Assert the identity is the stable by-id string, not the transient `node`.
+- [ ] **Step 2 — RED.** `python -m pytest tests/discovery/test_discovery.py -v` → FAIL (`No module
+  named 'mmco.discovery'`).
+- [ ] **Step 3 — Implement.** Add `discovery/__init__.py`, `discovery/discovery.py` with the enum,
+  dataclass, `discover_devices`, and the default best-effort Linux enumerators (glob-based, empty when
+  absent). Keep enumerators tiny and pure-stdlib.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Discovery: enumerate devices with stable identity behind injectable seams`.
+
+### Task 8.2 — Default-session builder (kind → driver, runnable filter)
+
+**Files:** create `src/mmco/discovery/default_session.py`, `tests/discovery/test_default_session.py`.
+(Spec §3 component 8, §7.)
+
+`build_default_session(devices, *, output_dir, runnable_drivers) -> SessionConfig` maps each device
+kind to its driver name, builds a `SensorConfig` per device (id from a stable slug, `identity` from the
+device, a sensible default `rate_hz`/`protocol` per kind), then keeps only sensors whose driver is in
+`runnable_drivers`. (Fallback when empty is added in 8.3.)
+
+- [ ] **Step 1 — Failing tests.** Given a discovered video device and a serial device, with
+  `runnable_drivers={"webcam_v4l2", "serial_imu"}`: the result is a `SessionConfig` with one
+  `SensorConfig` per device — correct `driver` name, `identity` carried from the device, distinct ids,
+  `output_dir` as passed. With `runnable_drivers={"simulated"}` (today's real set): the same devices
+  are **filtered out** (no runnable real driver) leaving zero sensors — proving the honest seam.
+- [ ] **Step 2 — RED.** `python -m pytest tests/discovery/test_default_session.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `default_session.py` with the kind→driver map, the per-kind defaults,
+  and the runnable filter. Pure (no I/O).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Default Session: map discovered devices to sensors and filter to runnable`.
+
+### Task 8.3 — Simulated fallback
+
+**Files:** extend `src/mmco/discovery/default_session.py`, `tests/discovery/test_default_session.py`.
+(Spec §7 simulated fallback.)
+
+When the runnable filter leaves **zero** sensors (no hardware, or no runnable driver for what was
+found), `build_default_session` appends a single `simulated` `SensorConfig` so a fresh clone always
+records.
+
+- [ ] **Step 1 — Failing tests.** Empty `devices` → result has exactly one sensor, `driver ==
+  "simulated"`, with a sensible default `rate_hz`. Discovered real devices but
+  `runnable_drivers={"simulated"}` → also falls back to a single simulated sensor (real devices
+  filtered, fallback applied). When a runnable real driver *is* present, **no** simulated sensor is
+  appended.
+- [ ] **Step 2 — RED.** `python -m pytest tests/discovery/test_default_session.py -v` → FAIL on the new
+  cases.
+- [ ] **Step 3 — Implement.** Add the empty-after-filter fallback to `build_default_session`.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `Default Session: fall back to the simulated sensor when nothing runnable`.
+
+### Task 8.4 — CLI no-arg run + out-of-box integration + gate
+
+**Files:** modify `src/mmco/cli/main.py`, `tests/cli/test_run.py`; create
+`tests/integration/test_out_of_box.py`. (Spec §7, §8.)
+
+Make the `run` config positional optional. With no path: `discover_devices()` → `build_default_session(
+…, runnable_drivers=<registry keys>)` → `run_session`. With a path: unchanged (explicit overrides).
+
+- [ ] **Step 1 — Failing tests.** *CLI:* `main(["run", "--seconds", "1"])` (no config) returns `0`
+  (on the Windows dev box discovery is empty → sim fallback → records). *Integration
+  (`test_out_of_box.py`):* with discovery injected empty, `build_default_session` + `run_session`
+  finalize all three artifacts under `recordings/<session_id>/`; assert the lone stream's driver is the
+  simulated one.
+- [ ] **Step 2 — RED.** run both new tests → FAIL.
+- [ ] **Step 3 — Implement.** In `main`, make `config` `nargs="?"`; when absent, discover + build the
+  default session (passing the driver-registry keys as `runnable_drivers`) before `run_session`. Expose
+  the registry keys for reuse.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Full suite + lint.** `python -m pytest` → all green (Linux-only checks skip on
+  Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 6 — Update README.** Flip Phase 8 to ✅, Phase 9 to 🔜; refresh test count + stage line;
+  note `mmco run` with no config auto-discovers and falls back to simulated; add the real-enumerator
+  Linux-validation caveat to the existing follow-up.
+- [ ] **Step 7 — Commit.** `CLI: 'mmco run' with no config auto-discovers and falls back to simulated`
+  (code + integration), then `Docs: mark Phase 8 complete in progress README`.
+
+**Files (Phase 8 total):** `src/mmco/discovery/{__init__,discovery,default_session}.py`; extension to
+`src/mmco/cli/main.py`; `tests/discovery/test_*.py`, `tests/integration/test_out_of_box.py`,
+extension to `tests/cli/test_run.py`.
+
+**Outcome:** `mmco run` (no args) auto-detects sensors (reporting each with its stable identity) and
+falls back to the simulated sensor when nothing runnable is present, then records all three artifacts.
+Real drivers (webcam in Phase 9) plug into the same builder with no change to discovery.
 
 ---
 
