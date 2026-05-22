@@ -50,6 +50,7 @@ class Recorder:
         self._block_index: dict[str, int] = {}
         self._registered: set[str] = set()
         self._seen: set[str] = set()
+        self._failed: set[str] = set()
 
     def start(self) -> None:
         """Create the session directory."""
@@ -82,7 +83,10 @@ class Recorder:
         writer = self._writers.pop(sensor_id, None)
         if writer is None:
             return
-        writer.close()
+        try:
+            writer.close()
+        except Exception:
+            pass  # a broken writer's failure is already surfaced as a gap
         if writer.start_timestamp is not None:
             self._author.add_segment(
                 sensor_id,
@@ -100,8 +104,21 @@ class Recorder:
         if result is None:
             return False
         meta, payload = result
+        if meta.sensor_id in self._failed:
+            return True  # stream settled into a gap; drain but don't record
         t_event = self._offsets.event_time(meta.sensor_id, meta.t_acquire_ns)
-        self._writer_for(meta.sensor_id).write_event(t_event, payload)
+        try:
+            self._writer_for(meta.sensor_id).write_event(t_event, payload)
+        except Exception:
+            # A writer/disk failure becomes a coded gap; the core never goes down.
+            self.open_gap(
+                meta.sensor_id,
+                start=t_event,
+                end=t_event,
+                reason="writer failure",
+                code=ErrorCode.WRITER_FAILURE,
+            )
+            self._failed.add(meta.sensor_id)
         return True
 
     def open_gap(
