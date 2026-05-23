@@ -80,20 +80,21 @@ All phases complete — the design spec is fully implemented.
   Linux/WSL2 **runtime target** (default `fork`) this mixing must be verified — and if needed, all
   `multiprocessing` objects should be created from a single shared `spawn` context. Run the full suite
   (especially `tests/host/`) under WSL2/Linux and confirm green before relying on the cross-process
-  path there.
+  path there. — tracked in [#14](https://github.com/shreyassanghvi/MMCO/issues/14)
 - **Real device-enumerator validation (Phase 8).** Discovery's default enumerators glob `/dev`
   (`/dev/video*`, `/dev/ttyUSB*`/`/dev/ttyACM*`, `/dev/snd/pcmC*c`) and resolve stable identities via
   `/dev/by-id`; they return empty off Linux, so the suite covers the logic with injected fakes only.
   Confirm the real enumerators against actual hardware on Linux/WSL2 (USB attach needs `usbipd-win`).
+  — tracked in [#15](https://github.com/shreyassanghvi/MMCO/issues/15)
 - **Real webcam V4L2 backend (Phase 9).** The webcam driver's `v4l2` backend (PyAV opening
   `/dev/videoN`) only runs on Linux; every test uses the deterministic fake-capture backend, and the
   PyAV video writer encodes synthetic frames (works cross-platform, incl. Windows). Validate the real
   camera path via [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
-- **Docker image build/run (Phase 10).** The compose file is validated by the suite wherever the
-  Docker CLI is present (`docker compose config`), but the full `docker build` + `docker compose up`
-  smoke test is gated on a reachable Docker **daemon** and skips when one isn't running (as on the
-  Windows dev box with Docker Desktop stopped). Run `python -m pytest tests/integration/test_container_smoke.py`
-  on a host with the daemon up (Linux/CI) to validate the image end to end.
+  — tracked in [#16](https://github.com/shreyassanghvi/MMCO/issues/16)
+- **Docker image build/run (Phase 10).** ✅ Validated — the image builds and a sim-fallback session
+  records to the host volume, with detached `docker exec mmco mmco status` / `mmco stop` exercised end
+  to end. The full smoke test (`tests/integration/test_container_smoke.py`) runs wherever a Docker
+  daemon is reachable and skips otherwise; the compose file is also validated via `docker compose config`.
 
 ---
 
