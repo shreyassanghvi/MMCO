@@ -49,6 +49,7 @@ names the fault in plain English with its error code.
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
 - Implementation plan — [`docs/superpowers/plans/2026-05-20-mmco-sensor-backbone-plan.md`](docs/superpowers/plans/2026-05-20-mmco-sensor-backbone-plan.md)
+- Feature demo — [`examples/`](examples/) — `python examples/demo.py` walks through every feature (no hardware/Docker)
 
 ### Phase progress
 
