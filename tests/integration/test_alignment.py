@@ -56,9 +56,19 @@ def test_declared_offset_reaches_manifest_latency_offset(tmp_path):
     )
     supervisor.start()
     try:
-        for _ in range(10):
+        # Tick until the spawned sim child has actually delivered a sample, then a little longer.
+        # A fixed short window can race ahead of the child's startup under load (slower on Linux
+        # spawn), leaving streams empty; the wait is bounded so a stuck child still fails fast.
+        deadline = time.monotonic() + 10.0
+        recorded = False
+        while time.monotonic() < deadline and not recorded:
             supervisor.tick()
+            recorded = any(rt.last_t_acquire_ns for rt in supervisor._runtimes.values())
             time.sleep(0.02)
+        assert recorded, "sim child never delivered a sample"
+        for _ in range(5):
+            supervisor.tick()
+            time.sleep(0.01)
     finally:
         supervisor.stop()
 
