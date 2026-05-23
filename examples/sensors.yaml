@@ -1,0 +1,30 @@
+# Example MMCO session config. Run with:  mmco run examples/sensors.yaml --seconds 10
+#
+# The active sensor below is the simulated driver, so this file runs anywhere with no hardware.
+# Uncomment the webcam block on a Linux host with a USB camera (see docs/hardware-checklist.md).
+
+output_dir: .
+
+# Per-protocol recording profiles; a sensor's `profile_override` wins per key.
+recording_profiles:
+  v4l2:
+    container: mp4
+    codec: libx264
+    crf: 23
+
+sensors:
+  - id: imu0
+    driver: simulated
+    identity: id-imu0
+    rate_hz: 50.0
+    latency_offset_ns: 2000000   # 2 ms declared device latency (corrected in t_event)
+
+  # --- Real USB webcam (Linux only) -----------------------------------------------------------
+  # Find the stable identity with:  ls -l /dev/v4l/by-id/
+  # - id: cam0
+  #   driver: webcam_v4l2
+  #   identity: /dev/v4l/by-id/usb-046d_Logitech_BRIO-video-index0
+  #   rate_hz: 30.0
+  #   protocol: v4l2
+  #   profile_override:
+  #     crf: 18                  # higher quality than the v4l2 default (23)
