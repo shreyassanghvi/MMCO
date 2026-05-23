@@ -16,20 +16,35 @@ time-aligned manifest that *is* the documentation, and recordings that keep goin
 
 ## Status
 
-**Current stage:** Phase 9 complete (webcam + video writer green); Phase 10 next.
-**Active branch:** `impl/phase-9-webcam-video` (off `master`).
-**Last updated:** 2026-05-22.
+**Current stage:** Phase 10 complete — all phases done. MMCO ships as a containerized service.
+**Active branch:** `impl/phase-10-containerization` (off `master`).
+**Last updated:** 2026-05-23.
 
-Quick start (dev): `python -m pip install -e ".[dev]"` then `python -m pytest` — 126 passing
-(2 skipped: POSIX-only shared-memory sweep tests, skipped on Windows). Then `mmco run` (no config)
-auto-discovers plugged-in devices — a USB webcam records to `mp4` (with a per-frame timestamp
-sidecar) alongside tabular streams — and **falls back to the simulated sensor when nothing runnable
-is found**, so a fresh clone always records; `mmco run sensors.yaml --seconds 10` records a
-configured session instead. Either way it prints a live per-sensor status table and finalizes
-`manifest.json` + `session.log.jsonl` + `summary.md` on completion or Ctrl-C. Kill or unplug a sensor
-mid-session and the others keep recording while it auto-reconnects into a new segment — the summary
-names the fault in plain English with its error code. Running the real webcam on hardware:
+### One command (container)
+
+```
+docker compose up --build        # records to ./recordings on the host; Ctrl-C / `down` to stop
+docker compose exec mmco mmco status   # live per-sensor table from the running session
+docker compose exec mmco mmco stop     # graceful finalize (manifest + log + summary)
+```
+
+With no devices mapped the container records via the **simulated fallback**, so a fresh clone always
+produces a recording. Map real capture devices (and find their stable identities) per the device
+passthrough block in [`docker-compose.yml`](docker-compose.yml) and
 [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
+
+### Local (dev)
+
+`python -m pip install -e ".[dev]"` then `python -m pytest` — 138 passing (3 skipped: POSIX-only
+shared-memory sweep tests + the Docker-daemon-gated container smoke test, skipped on Windows). Then
+`mmco run` (no config) auto-discovers plugged-in devices — a USB webcam records to `mp4` (with a
+per-frame timestamp sidecar) alongside tabular streams — and **falls back to the simulated sensor
+when nothing runnable is found**. `mmco run sensors.yaml --seconds 10` records a configured session;
+with no `--seconds` it runs until `mmco stop`, Ctrl-C, or SIGTERM. A running session hosts a loopback
+control channel, so `mmco status` and `mmco stop` work from another shell (or `docker exec`). Every
+session finalizes `manifest.json` + `session.log.jsonl` + `summary.md`. Kill or unplug a sensor
+mid-session and the others keep recording while it auto-reconnects into a new segment — the summary
+names the fault in plain English with its error code.
 
 ### Documents
 - Design spec — [`docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md`](docs/superpowers/specs/2026-05-20-mmco-sensor-backbone-design.md)
@@ -51,9 +66,11 @@ names the fault in plain English with its error code. Running the real webcam on
 | 7  | Control surface: config, CLI, live status | ✅ Done — YAML config + profiles, `mmco run`, live status table |
 | 8  | Device discovery + default session + out-of-box | ✅ Done — injectable enumerators + stable identity, default-session builder, sim fallback, `mmco run` no-arg |
 | 9  | USB webcam (V4L2) driver + video writer | ✅ Done — webcam driver (fake-capture seam), PyAV mp4 writer + timestamp sidecar, ±2 ms alignment |
-| 10 | Containerization & one-command launch | 🔜 Next |
+| 10 | Containerization & one-command launch | ✅ Done — unbounded run + signals, loopback control daemon (`status`/`stop`), Dockerfile + compose, sim-fallback smoke |
 
 Legend: ✅ done · 🔜 next up · ⬜ not started
+
+All phases complete — the design spec is fully implemented.
 
 ### Known follow-ups
 
@@ -72,6 +89,11 @@ Legend: ✅ done · 🔜 next up · ⬜ not started
   `/dev/videoN`) only runs on Linux; every test uses the deterministic fake-capture backend, and the
   PyAV video writer encodes synthetic frames (works cross-platform, incl. Windows). Validate the real
   camera path via [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
+- **Docker image build/run (Phase 10).** The compose file is validated by the suite wherever the
+  Docker CLI is present (`docker compose config`), but the full `docker build` + `docker compose up`
+  smoke test is gated on a reachable Docker **daemon** and skips when one isn't running (as on the
+  Windows dev box with Docker Desktop stopped). Run `python -m pytest tests/integration/test_container_smoke.py`
+  on a host with the daemon up (Linux/CI) to validate the image end to end.
 
 ---
 
@@ -95,4 +117,11 @@ docs/superpowers/plans/   phased implementation plan
 src/mmco/                 package (created in Phase 0)
 tests/                    pytest suite (created in Phase 0)
 recordings/               captured sessions — gitignored output, not source
+Dockerfile                containerized service image
+docker-compose.yml        one-command launch (volume + device-passthrough docs)
+docker/entrypoint.sh      container entrypoint (records until stopped)
 ```
+
+Each session writes `recordings/<session_id>/` containing `manifest.json` (the alignment contract),
+per-stream files (`*.mp4` + per-frame timestamp sidecar, `*.parquet`), `session.log.jsonl`,
+`summary.md`, and — while running — `control.addr` (the loopback control-channel port).
