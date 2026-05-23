@@ -20,7 +20,10 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir .
 
+COPY docker/entrypoint.sh /usr/local/bin/mmco-entrypoint.sh
+RUN chmod +x /usr/local/bin/mmco-entrypoint.sh
+
 USER mmco
 ENV MMCO_OUTPUT_DIR=/data
 # Records until the container is stopped (SIGTERM) or `mmco stop`.
-CMD ["mmco", "run"]
+ENTRYPOINT ["/usr/local/bin/mmco-entrypoint.sh"]
