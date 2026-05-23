@@ -1455,24 +1455,167 @@ path is documented in the checklist; everything else is hardware-free and always
 
 **Goal:** Ship MMCO as a containerized service with a single launch command.
 
-**Tasks**
-- **10.1 Dockerfile** — Linux base with ffmpeg + Python deps; install `mmco`; non-root user. *Tested by:*
-  image builds; `mmco --help` runs in-container.
-- **10.2 docker-compose** — service def with a mounted host **volume** at `recordings/` (output survives
-  the container) and **device passthrough** (`devices: ["/dev/video0:/dev/video0", ...]` + relevant
-  `group_add`/udev for V4L2/ALSA/serial; documented privileged/`--device-cgroup-rule` fallback for
-  dynamic device sets). `mmco status` attaches over the control socket when detached. *Tested by:*
-  `docker compose up` runs a sim-only session and writes a recording to the host volume; `status`
-  reachable on the detached container.
-- **10.3 Entrypoint + default config** — container defaults to auto-discovery/sim fallback so
-  `docker compose up` records with no extra steps even with **no devices mapped**. *Tested by:*
-  container with no devices → sim fallback recording (manifest + log + summary) appears on the host.
-- **10.4 README quickstart** — one-command instructions, hardware notes, output layout. *(Docs.)*
+**Branch:** `impl/phase-10-containerization` (off `master`, after Phase 9 merge).
 
-**Files:** `Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh`, `README.md`;
-`tests/integration/test_container_smoke.py` (optional, env-gated).
+**Design decisions (locked for this phase):**
+- **The IPC control daemon is built here (un-defers Phase 7).** A running `mmco run` session **hosts a
+  control listener in a background thread** — there is no separate daemon process; the session *is* the
+  server. `mmco status` and `mmco stop` are short-lived **client** commands that connect to it. This
+  delivers the spec §7 detached `status`/`stop` that Phase 7 deferred for lack of an IPC channel.
+- **Transport: TCP loopback (`127.0.0.1`).** The server binds an ephemeral port on `127.0.0.1` and
+  writes it to `<session_dir>/control.addr`; clients read that file to connect. Chosen over a Unix
+  socket because it behaves **identically on Windows and Linux**, so the full client/server round-trip
+  is tested green on this dev box (no platform skip). Inside a container the client connects to
+  `127.0.0.1` (e.g. `docker exec <c> mmco status`); **no port is exposed to the host**, so this is not
+  a network service. The bind is loopback-only by construction.
+- **Protocol: line-delimited JSON, two commands.** Request `{"cmd":"status"}` -> `{"ok":true,"body":
+  "<rendered status table>"}`; request `{"cmd":"stop"}` sets the session's stop flag and acks
+  `{"ok":true,...}`. The server is read-only for `status` (calls `Supervisor.snapshot()`); `stop`
+  triggers the same graceful finalize as a signal.
+- **Container records until stopped.** `docker compose up` must record until `docker compose down`
+  (SIGTERM) or `mmco stop`, not for a fixed 10 s. So `run` gains an **unbounded** mode (no `--seconds`
+  -> run until a stop request) with graceful finalize on **SIGTERM/SIGINT** and on a control `stop`.
+  All three set one stop flag the tick loop checks; the signal handler and the control `stop` are
+  unit-tested by exercising the flag directly (cross-platform, deterministic).
+- **Env-var config for zero-arg containers.** `mmco run` reads its output directory from
+  `MMCO_OUTPUT_DIR` when `--output-dir` is not given. `mmco status`/`mmco stop` locate the running
+  session by finding the newest `control.addr` under the output dir's recordings (overridable with an
+  explicit `--session-dir`).
+- **Docker artifacts are validated by an env-gated smoke test.** The Dockerfile/compose/entrypoint are
+  infra, not RED->GREEN units; a smoke test **skips when Docker is absent** (same pattern as the POSIX
+  shm skips). I will run a real `docker build` / `docker compose up` **if Docker is on the box**; if
+  not (the Windows dev box may lack it), the container path is **flagged for Linux/CI validation**.
+- **Base image + deps.** `python:3.14-slim`; apt-install `ffmpeg` + `v4l-utils`; `pip install .`; run
+  as a **non-root** user. The exact base tag is confirmed at build (3.14 is GA in this timeline).
+- **Build order:** 10.1 container-friendly `run` -> 10.2 control server + protocol -> 10.3 control
+  client + `mmco status`/`mmco stop` -> 10.4 Dockerfile -> 10.5 compose + entrypoint + smoke test ->
+  10.6 README quickstart + gate.
+- Commands via the venv interpreter; ruff exit code checked directly.
 
-**Outcome:** `docker compose up` → a recording on the host. The containerized-service story is shipped.
+### Task 10.1 — Container-friendly `run`: unbounded + signals + env output dir
+
+**Files:** modify `src/mmco/cli/main.py`; extend `tests/cli/test_run.py`. (Spec §7.)
+
+`run_session` accepts `max_seconds: float | None` (None = run until a stop request) driven by a shared
+**stop flag**. `mmco run` makes `--seconds` optional (no default -> unbounded) and reads
+`--output-dir` from `MMCO_OUTPUT_DIR` when unset. A stop-signal helper installs SIGTERM/SIGINT
+handlers that set the flag; the tick loop checks it each pass and finalizes gracefully.
+
+- [ ] **Step 1 — Failing tests.** `--output-dir` falls back to `MMCO_OUTPUT_DIR` (monkeypatched env)
+  when the flag is absent, and the flag still wins when given; setting the stop flag ends an otherwise
+  unbounded run (finalizing all artifacts); the existing bounded `--seconds 1` path still finalizes.
+- [ ] **Step 2 — RED.** `python -m pytest tests/cli/test_run.py -v` → FAIL on the new cases.
+- [ ] **Step 3 — Implement.** Make `max_seconds` optional with a stop-flag loop; add the SIGTERM/SIGINT
+  helper; read `MMCO_OUTPUT_DIR`; keep the bounded path intact.
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `CLI: unbounded run with a stop flag, signal finalize, and MMCO_OUTPUT_DIR`.
+
+### Task 10.2 — Control server + protocol (the IPC daemon)
+
+**Files:** create `src/mmco/ipc/__init__.py`, `src/mmco/ipc/server.py`,
+`tests/ipc/test_control_server.py`. (Spec §7.)
+
+`ControlServer(*, snapshot, request_stop, addr_path)` binds `127.0.0.1:0`, writes the chosen port to
+`addr_path` (`control.addr`), and serves line-delimited JSON in a background thread: `status` ->
+`{"ok":true,"body": render_status(snapshot())}`; `stop` -> calls `request_stop()` and acks. `close()`
+stops the thread and removes the addr file.
+
+- [ ] **Step 1 — Failing tests.** Start a server over a fake `snapshot` callable and a stop sentinel;
+  a raw client socket sends `{"cmd":"status"}` and gets back the rendered table containing the fake
+  sensor ids; `{"cmd":"stop"}` invokes `request_stop` (sentinel flips) and acks; an unknown command
+  returns `{"ok":false}` without crashing the server; `control.addr` exists while serving and is gone
+  after `close()`. (All over real loopback sockets — runs on Windows + Linux.)
+- [ ] **Step 2 — RED.** `python -m pytest tests/ipc/test_control_server.py -v` → FAIL.
+- [ ] **Step 3 — Implement.** Add `ipc/server.py` (stdlib `socket`/`threading`/`json`; loopback only;
+  daemon thread; clean shutdown).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `IPC: loopback control server answering status and stop over JSON`.
+
+### Task 10.3 — Control client + `mmco status` / `mmco stop`
+
+**Files:** create `src/mmco/ipc/client.py`; modify `src/mmco/cli/main.py` (host the server in
+`run_session`; add `status`/`stop` subcommands); create `tests/ipc/test_control_client.py`,
+`tests/integration/test_control_commands.py`. (Spec §7.)
+
+`control_request(addr_path, cmd) -> dict` reads `control.addr`, connects, sends one command, returns
+the response. `find_session_addr(output_dir, session_dir=None)` locates the newest `control.addr`
+under the recordings root. `run_session` starts a `ControlServer` (wired to `supervisor.snapshot` and
+the stop flag) for the session's lifetime. `main` gains `status` and `stop` subcommands.
+
+- [ ] **Step 1 — Failing tests.** Client unit: against a live `ControlServer`, `control_request(...,
+  "status")` returns the rendered body and `"stop"` acks. Integration (`test_control_commands.py`):
+  start an **unbounded** `run_session` on a background thread; `mmco status` (via `main`) prints a table
+  naming the running sensor; `mmco stop` (via `main`) makes the run finalize all three artifacts and the
+  thread exit. Locating the session via the newest `control.addr` works.
+- [ ] **Step 2 — RED.** run the new tests → FAIL.
+- [ ] **Step 3 — Implement.** Add `ipc/client.py`; host the server in `run_session`; add the `status`
+  and `stop` argparse subcommands (resolve `--output-dir`/`MMCO_OUTPUT_DIR`, optional `--session-dir`).
+- [ ] **Step 4 — GREEN.** pass.
+- [ ] **Step 5 — Commit.** `CLI: detached 'mmco status' and 'mmco stop' over the control channel`.
+
+### Task 10.4 — Dockerfile
+
+**Files:** create `Dockerfile`, `.dockerignore`. (Spec §7.)
+
+A `python:3.14-slim` image: apt-install `ffmpeg` + `v4l-utils`, copy the project, `pip install .`,
+create and switch to a non-root user, default `CMD` to `mmco run`. `.dockerignore` excludes
+`recordings/`, `.venv/`, `.git/`, caches.
+
+- [ ] **Step 1 — Build (if Docker present).** `docker build -t mmco:dev .`; then
+  `docker run --rm mmco:dev mmco --help` prints usage. If Docker is absent on the box, record that the
+  build is **deferred to Linux/CI** and proceed (the artifacts are still authored).
+- [ ] **Step 2 — Commit.** `Container: add Dockerfile (slim base, ffmpeg, non-root, mmco entrypoint)`.
+
+### Task 10.5 — docker-compose + entrypoint + env-gated smoke test
+
+**Files:** create `docker-compose.yml`, `docker/entrypoint.sh`;
+`tests/integration/test_container_smoke.py`. (Spec §7.)
+
+A compose service that: mounts a host volume at the recordings directory (output survives the
+container); sets `MMCO_OUTPUT_DIR`; runs the entrypoint (a bare `mmco run` -> auto-discovery/sim
+fallback); and **documents** device passthrough (commented `devices:` examples for
+`/dev/video0`/ALSA/serial, the `group_add`/udev notes, and the privileged/`--device-cgroup-rule`
+fallback for dynamic device sets). `docker exec <c> mmco status` reaches the in-container control
+server; `docker exec <c> mmco stop` (or `docker compose down`) finalizes. The smoke test is
+**env-gated**: it skips unless Docker is available.
+
+- [ ] **Step 1 — Failing/var test.** `tests/integration/test_container_smoke.py` skips when `docker`
+  is not on `PATH`; when present, it runs `docker compose up` with **no devices mapped**, then
+  `docker exec ... mmco status` returns a table and `mmco stop` finalizes — a sim-fallback recording
+  (`manifest.json` + `session.log.jsonl` + `summary.md`) appears on the **host volume**. On the Windows
+  dev box (no Docker) it skips.
+- [ ] **Step 2 — RED/skip.** `python -m pytest tests/integration/test_container_smoke.py -v` → skip
+  (no Docker) or FAIL (Docker present, compose/entrypoint not yet written).
+- [ ] **Step 3 — Implement.** Add `docker-compose.yml`, `docker/entrypoint.sh` (exec `mmco run`); make
+  the smoke test pass where Docker is present.
+- [ ] **Step 4 — GREEN/skip.** pass or skip.
+- [ ] **Step 5 — Commit.** `Container: compose with volume, device-passthrough docs, and a smoke test`.
+
+### Task 10.6 — README quickstart + Phase 10 gate
+
+**Files:** update `README.md`. (Spec §7.)
+
+- [ ] **Step 1 — README quickstart.** One-command launch (`docker compose up` -> a recording on the
+  host volume); `docker exec <c> mmco status` for the live table and `mmco stop` / `docker compose down`
+  to finalize; device passthrough + hardware notes (link the checklist); the `recordings/<session_id>/`
+  output layout (incl. `control.addr` while running).
+- [ ] **Step 2 — Full suite + lint.** `python -m pytest` → all green (Linux-only + Docker-gated checks
+  skip on Windows); `python -m ruff check .` (verify exit `0`).
+- [ ] **Step 3 — Update README status.** Flip Phase 10 to ✅; refresh test/skip count + stage line;
+  note the control channel; record any Docker-on-Linux validation follow-up. Remove the Phase 7
+  detached-`status` deviation note (now delivered).
+- [ ] **Step 4 — Commit.** `Docs: container quickstart and mark Phase 10 complete`.
+
+**Files (Phase 10 total):** `src/mmco/ipc/{__init__,server,client}.py`, `Dockerfile`, `.dockerignore`,
+`docker-compose.yml`, `docker/entrypoint.sh`; extension to `src/mmco/cli/main.py`, `README.md`;
+`tests/ipc/test_*.py`, `tests/integration/{test_control_commands,test_container_smoke}.py`, extension
+to `tests/cli/test_run.py`.
+
+**Outcome:** `docker compose up` -> a recording on the host (auto-discovery, sim fallback with no
+devices), surviving the container via the mounted volume. The running session hosts a loopback control
+channel, so `mmco status` (live table) and `mmco stop` (graceful finalize) work whether the box runs in
+the foreground or detached in the container — the Phase 7 deferral is delivered. A real `docker
+build`/`up` on Linux is the only remaining validation follow-up.
 
 ---
 
@@ -1484,7 +1627,8 @@ path is documented in the checklist; everything else is hardware-free and always
 - **Spec §4 timestamping** → 1.4 (clock/offset), 3.2 (stamp at acquisition), 4.3 (manifest anchor). ✓
 - **Spec §5 recording/manifest** → Phase 4 + 9.2 (video). ✓
 - **Spec §6 degradation/auto-reconnect** → Phase 5. ✓
-- **Spec §7 out-of-the-box** → Phase 8 + 10.3. ✓
+- **Spec §7 out-of-the-box + detached control** → Phase 8 (discovery/fallback) + Phase 10 (one-command
+  container) + 10.2/10.3 (loopback control daemon: detached `status`/`stop`). ✓
 - **Spec §8 thin slice (sim + webcam)** → Phases 3, 9; degradation demo in 5/9. ✓
 - **Spec §9 testing (TDD, always-green CI, fault injection, hardware checklist)** → every phase is
   test-first; 4.4 CI path; 5 fault injection; 9.4 checklist. ✓

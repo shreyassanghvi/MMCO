@@ -1,0 +1,29 @@
+services:
+  mmco:
+    build: .
+    image: mmco:dev
+    # Stop with `docker compose down` (SIGTERM) or `docker compose exec mmco mmco stop`.
+    stop_grace_period: 10s
+    environment:
+      MMCO_OUTPUT_DIR: /data
+    volumes:
+      # Captured sessions land on the host and survive the container.
+      - ./recordings:/data/recordings
+
+    # --- Device passthrough -------------------------------------------------------------------
+    # With NO devices mapped (the default), the container records via the simulated fallback.
+    # Uncomment what you have; see docs/hardware-checklist.md for finding stable identities.
+    # devices:
+    #   - "/dev/video0:/dev/video0"    # USB webcam (V4L2)
+    #   - "/dev/snd:/dev/snd"           # ALSA audio
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"   # serial IMU
+    # group_add:
+    #   - video
+    #   - audio
+    #   - dialout
+    #
+    # For a dynamic/unknown device set, a broad fallback (least restrictive):
+    # privileged: true
+    # or a targeted cgroup rule (here: V4L2 major 81):
+    # device_cgroup_rules:
+    #   - "c 81:* rmw"
